@@ -1,0 +1,22 @@
+# Python runtime artifacts
+__pycache__/
+*.py[cod]
+
+# Scanner runtime state and historical outputs
+work/
+outputs/
+*.jsonl
+*.log
+
+# Local secrets and environment overrides
+.env
+.env.*
+!.env.example
+option-scanner.env
+!option-scanner.env.example
+
+# Editor and operating-system files
+.DS_Store
+.idea/
+.vscode/
+*~
