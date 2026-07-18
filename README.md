@@ -152,3 +152,36 @@ tail -f ~/.local/state/option-scanner/service.stderr.log
 ```bash
 ./install.sh --uninstall --purge
 ```
+
+## CI 与 GitHub Release
+
+推送到 `main` 或创建 Pull Request 时，GitHub Actions 会在 Python 3.9 和 3.12 上运行
+静态检查及无网络单元测试。普通提交不会创建部署版本。
+
+准备发布时创建不可变的语义化版本标签：
+
+```bash
+git tag -a v0.1.0 -m "v0.1.0"
+git push origin v0.1.0
+```
+
+`.github/workflows/release.yml` 会自动重新检查代码，调用 `build_release.sh`，创建 GitHub
+Release 并上传：
+
+```text
+meridian-scanner-flux-v0.1.0.tar.gz
+SHA256SUMS
+```
+
+目标机器可以使用 GitHub CLI 下载并校验：
+
+```bash
+gh release download v0.1.0 --repo yaogunfantuan/meridian-scanner-flux
+shasum -a 256 -c SHA256SUMS   # Linux 也可使用 sha256sum -c
+tar -xzf meridian-scanner-flux-v0.1.0.tar.gz
+cd meridian-scanner-flux-v0.1.0
+./install.sh --start
+```
+
+私有仓库需要先在目标机器完成 `gh auth login`，或为 GitHub CLI 配置只读细粒度 Token。
+如果 Release 工作流暂时失败，可以在 Actions 页面重试；不要强制移动已经发布的版本标签。

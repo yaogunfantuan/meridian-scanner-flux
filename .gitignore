@@ -5,6 +5,7 @@ __pycache__/
 # Scanner runtime state and historical outputs
 work/
 outputs/
+dist/
 *.jsonl
 *.log
 
