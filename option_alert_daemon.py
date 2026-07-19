@@ -163,7 +163,20 @@ def scan_nodes(
     for row in candidates:
         row["venue"] = label
     p1_rows = [row for row in candidates if core.is_p1_local(row, args)]
-    p1_rows.sort(key=lambda row: (row["score"], row["net_edge_ticks"]), reverse=True)
+    for row in p1_rows:
+        row["mode"] = "PCP_NET" if core.is_pcp_net(row, args) else "LOCAL_NET"
+    p1_rows.sort(
+        key=lambda row: (
+            row["mode"] == "PCP_NET",
+            (
+                row.get("parity_net_usdt")
+                if row["mode"] == "PCP_NET"
+                else row.get("single_net_usdt")
+            ) or 0.0,
+            row["score"],
+        ),
+        reverse=True,
+    )
     local_signals = {
         row["instrument"]: row["signal"]
         for row in candidates
@@ -185,6 +198,8 @@ def scan_nodes(
         "returned": len(nodes),
         "two_sided": sum(node.valid_bid and node.valid_ask for node in nodes),
         "p1": len(p1_rows),
+        "pcp_net": sum(row["mode"] == "PCP_NET" for row in p1_rows),
+        "local_net": sum(row["mode"] == "LOCAL_NET" for row in p1_rows),
         "one_tick_alerts": len(tick_alerts),
         "one_tick_all": len(one_ticks),
         "seconds": seconds,
@@ -223,13 +238,23 @@ def format_feishu_message(
         f"耗时 {elapsed:.1f}s；ticker {ticker_bytes / 1024 / 1024:.2f} MiB",
     ]
     if p1_rows:
-        lines.append(f"\nP1 高置信度：{len(p1_rows)}")
+        lines.append(f"\n手续费后可执行候选：{len(p1_rows)}")
         for row in p1_rows[:limit]:
             one_tick = " [1-tick]" if row.get("one_tick") else ""
+            if row["mode"] == "PCP_NET":
+                detail = (
+                    f"PCP净 {row['parity_net_ticks']:.1f}t / "
+                    f"{row['parity_net_usdt']:.2f} USDT"
+                )
+            else:
+                detail = (
+                    f"单腿毛 {row['single_gross_usdt']:.2f}；"
+                    f"费×2 {row['single_fee_usdt']:.2f}；"
+                    f"净 {row['single_net_usdt']:.2f} USDT"
+                )
             lines.append(
                 f"{row['venue']} {row['instrument']} {row['signal']} @ {row['price']:g} "
-                f"× {row['size']:g}；LOCAL {row['net_edge_ticks']:.1f}t；"
-                f"Parity {row['parity_edge_ticks']:.1f}t{one_tick}"
+                f"× {row['size']:g}；{row['mode']}；{detail}{one_tick}"
             )
     if tick_rows:
         remaining = max(limit - min(len(p1_rows), limit), 0)
@@ -244,7 +269,8 @@ def format_feishu_message(
     lines.append(
         "\n覆盖 "
         + "；".join(
-            f"{row['venue']} {row['returned']}/{row['active']}，P1 {row['p1']}"
+            f"{row['venue']} {row['returned']}/{row['active']}，"
+            f"PCP {row['pcp_net']} / LOCAL {row['local_net']}"
             for row in summaries
         )
     )
@@ -306,6 +332,18 @@ def add_scan_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--mark-regime-min-bias", type=float, default=0.02)
     parser.add_argument("--min-parity-edge-ticks", type=float, default=1.0)
     parser.add_argument("--min-vega-ticks-per-pp", type=float, default=1.0)
+    parser.add_argument(
+        "--hedge-taker-rate",
+        type=float,
+        default=0.0005,
+        help="PCP回转估算中的Delta对冲单边Taker费率，默认0.05%%",
+    )
+    parser.add_argument(
+        "--hedge-leverage",
+        type=float,
+        default=10.0,
+        help="经典保证金资金占用估算使用的对冲杠杆，默认10倍",
+    )
 
 
 def parse_args() -> argparse.Namespace:
@@ -332,6 +370,8 @@ def parse_args() -> argparse.Namespace:
         parser.error("interval、catalog-ttl 必须大于 0，max-log-mb 不能小于 0")
     if args.workers < 1 or not 0 < args.rate_limit <= 10:
         parser.error("workers 至少为 1，rate-limit 必须在 0 到 10 之间")
+    if args.hedge_taker_rate < 0 or args.hedge_leverage <= 0:
+        parser.error("hedge-taker-rate 不能小于 0，hedge-leverage 必须大于 0")
     if args.notify and not os.environ.get("FEISHU_WEBHOOK_URL"):
         parser.error("--notify 需要环境变量 FEISHU_WEBHOOK_URL")
     return args
@@ -393,7 +433,18 @@ def main() -> int:
                 p1_rows.extend(current_p1)
                 tick_rows.extend(current_ticks)
 
-            p1_rows.sort(key=lambda row: (row["score"], row["net_edge_ticks"]), reverse=True)
+            p1_rows.sort(
+                key=lambda row: (
+                    row["mode"] == "PCP_NET",
+                    (
+                        row.get("parity_net_usdt")
+                        if row["mode"] == "PCP_NET"
+                        else row.get("single_net_usdt")
+                    ) or 0.0,
+                    row["score"],
+                ),
+                reverse=True,
+            )
             tick_rows.sort(
                 key=lambda row: (row["alert_basis"] == "LOCAL", row["mark_gap"], row["depth"]),
                 reverse=True,
@@ -412,16 +463,20 @@ def main() -> int:
                 f"按当前轮估算 {estimated_gib_day:.2f} GiB/日"
             )
             core.print_table(
-                ("venue", "active", "returned", "two_sided", "P1", "1tick_alert", "1tick_all", "seconds"),
+                (
+                    "venue", "active", "returned", "two_sided", "candidates",
+                    "PCP_NET", "LOCAL_NET", "1tick_alert", "1tick_all", "seconds",
+                ),
                 [
                     (
                         row["venue"], row["active"], row["returned"], row["two_sided"],
-                        row["p1"], row["one_tick_alerts"], row["one_tick_all"], row["seconds"],
+                        row["p1"], row["pcp_net"], row["local_net"],
+                        row["one_tick_alerts"], row["one_tick_all"], row["seconds"],
                     )
                     for row in summaries
                 ],
             )
-            core.print_candidate_section("P1 高置信度", p1_rows, args.limit)
+            core.print_candidate_section("手续费后可执行候选", p1_rows, args.limit)
             print_tick_alerts(tick_rows, args.limit)
 
             record = {

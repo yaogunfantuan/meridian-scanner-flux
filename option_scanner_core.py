@@ -39,6 +39,14 @@ class Node:
     mark_iv: float | None
     forward: float | None
     discount: float
+    index_price: float | None = None
+    contract_multiplier: float = 1.0
+    taker_fee_rate: float | None = None
+    trade_fee_cap_rate: float | None = None
+    settlement_fee_rate: float | None = None
+    settlement_fee_cap_rate: float | None = None
+    initial_margin_low: float | None = None
+    initial_margin_high: float | None = None
 
     @property
     def valid_bid(self) -> bool:
@@ -298,12 +306,87 @@ def black_forward_vega(
     return discount * forward * density * math.sqrt(years)
 
 
-def executable_parity_edge(
+def option_trade_fee_per_underlying(node: Node, price: float | None) -> float | None:
+    """Return taker fee in quote currency per one unit of underlying."""
+    if (
+        price is None
+        or price < 0
+        or node.index_price is None
+        or node.index_price <= 0
+        or node.taker_fee_rate is None
+        or node.taker_fee_rate < 0
+    ):
+        return None
+    fee = node.taker_fee_rate * node.index_price
+    if node.trade_fee_cap_rate is not None and node.trade_fee_cap_rate >= 0:
+        fee = min(fee, node.trade_fee_cap_rate * price)
+    return max(fee, 0.0)
+
+
+def option_settlement_fee_per_underlying(node: Node) -> float | None:
+    """Estimate expiry fee at the calibrated forward; exactly one C/P leg is ITM."""
+    if (
+        node.forward is None
+        or node.forward <= 0
+        or node.settlement_fee_rate is None
+        or node.settlement_fee_rate < 0
+    ):
+        return None
+    intrinsic = (
+        max(node.forward - node.strike, 0.0)
+        if node.option_type == "C"
+        else max(node.strike - node.forward, 0.0)
+    )
+    if intrinsic <= 0:
+        return 0.0
+    fee = node.settlement_fee_rate * node.forward
+    if node.settlement_fee_cap_rate is not None and node.settlement_fee_cap_rate >= 0:
+        fee = min(fee, node.settlement_fee_cap_rate * intrinsic)
+    return max(fee, 0.0)
+
+
+def short_option_initial_margin(node: Node, size: float) -> float | None:
+    """Estimate regular-margin initial margin for Gate-style linear options."""
+    if (
+        node.index_price is None
+        or node.index_price <= 0
+        or node.mark is None
+        or node.mark < 0
+        or node.initial_margin_low is None
+        or node.initial_margin_high is None
+        or node.contract_multiplier <= 0
+        or size <= 0
+    ):
+        return None
+    spot = node.index_price
+    if node.option_type == "C":
+        otm = max(node.strike - spot, 0.0)
+        risk = max(
+            node.initial_margin_low * spot,
+            node.initial_margin_high * spot - otm,
+        )
+    else:
+        otm = max(spot - node.strike, 0.0)
+        risk = max(
+            node.initial_margin_low * spot * (1 + node.mark / spot),
+            node.initial_margin_high * spot - otm,
+        )
+    return (risk + node.mark) * size * node.contract_multiplier
+
+
+def executable_parity_metrics(
     node: Node,
     signal: str,
     nodes_by_key: Dict[Tuple[str, str, float, str], Node],
-) -> Tuple[float, float] | None:
-    """Return executable C/P parity edge in candidate ticks and paired size."""
+    hedge_taker_rate: float,
+    hedge_leverage: float,
+) -> Dict[str, Any] | None:
+    """Return raw and fee-adjusted executable C/P parity economics.
+
+    The conservative reversion case assumes taker execution for opening and
+    closing both option legs plus opening and closing a one-delta hedge.
+    Funding is deliberately excluded because its future path is not locked.
+    """
     if not node.forward or node.forward <= 0 or node.tick <= 0:
         return None
     other_type = "P" if node.option_type == "C" else "C"
@@ -317,22 +400,113 @@ def executable_parity_edge(
             return None
         edge = parity_value - (node.ask - other.bid)
         size = min(node.ask_size or 0.0, other.bid_size or 0.0)
+        long_node, long_price = node, node.ask
+        short_node, short_price = other, other.bid
     elif node.option_type == "C" and signal == "SELL":
         if not node.valid_bid or not other.valid_ask or node.bid is None or other.ask is None:
             return None
         edge = (node.bid - other.ask) - parity_value
         size = min(node.bid_size or 0.0, other.ask_size or 0.0)
+        long_node, long_price = other, other.ask
+        short_node, short_price = node, node.bid
     elif node.option_type == "P" and signal == "BUY":
         if not node.valid_ask or not other.valid_bid or node.ask is None or other.bid is None:
             return None
         edge = (other.bid - node.ask) - parity_value
         size = min(node.ask_size or 0.0, other.bid_size or 0.0)
+        long_node, long_price = node, node.ask
+        short_node, short_price = other, other.bid
     else:  # SELL put
         if not node.valid_bid or not other.valid_ask or node.bid is None or other.ask is None:
             return None
         edge = parity_value - (other.ask - node.bid)
         size = min(node.bid_size or 0.0, other.ask_size or 0.0)
-    return edge / node.tick, size
+        long_node, long_price = other, other.ask
+        short_node, short_price = node, node.bid
+
+    multiplier = node.contract_multiplier
+    if multiplier <= 0 or not math.isclose(
+        multiplier, other.contract_multiplier, rel_tol=1e-9, abs_tol=1e-12
+    ):
+        return None
+    quantity = size * multiplier
+    raw_ticks = edge / node.tick
+    raw_usdt = edge * quantity
+
+    open_long_fee = option_trade_fee_per_underlying(long_node, long_price)
+    open_short_fee = option_trade_fee_per_underlying(short_node, short_price)
+    close_long_fee = option_trade_fee_per_underlying(long_node, long_node.bid)
+    close_short_fee = option_trade_fee_per_underlying(short_node, short_node.ask)
+    option_fees = (open_long_fee, open_short_fee, close_long_fee, close_short_fee)
+    option_roundtrip_fee = sum(option_fees) if all(fee is not None for fee in option_fees) else None
+
+    index_price = node.index_price or other.index_price
+    hedge_roundtrip_fee = (
+        2 * hedge_taker_rate * index_price
+        if index_price and index_price > 0 and hedge_taker_rate >= 0
+        else None
+    )
+    fully_costed = option_roundtrip_fee is not None and hedge_roundtrip_fee is not None
+    roundtrip_cost = (
+        option_roundtrip_fee + hedge_roundtrip_fee  # type: ignore[operator]
+        if fully_costed
+        else None
+    )
+    net_points = edge - roundtrip_cost if roundtrip_cost is not None else None
+
+    settlement_node = long_node if (
+        (long_node.option_type == "C" and node.forward >= node.strike)
+        or (long_node.option_type == "P" and node.forward < node.strike)
+    ) else short_node
+    settlement_fee = option_settlement_fee_per_underlying(settlement_node)
+    entry_option_fee = (
+        open_long_fee + open_short_fee
+        if open_long_fee is not None and open_short_fee is not None
+        else None
+    )
+    expiry_net_points = (
+        edge - entry_option_fee - settlement_fee
+        if entry_option_fee is not None and settlement_fee is not None
+        else None
+    )
+
+    short_margin = short_option_initial_margin(short_node, size)
+    pair_debit = max(long_price - short_price, 0.0) * quantity
+    hedge_margin = (
+        index_price * quantity / hedge_leverage
+        if index_price and index_price > 0 and hedge_leverage > 0
+        else None
+    )
+    capital = (
+        pair_debit + short_margin + hedge_margin
+        if short_margin is not None and hedge_margin is not None
+        else None
+    )
+    net_usdt = net_points * quantity if net_points is not None else None
+    return {
+        "raw_ticks": raw_ticks,
+        "raw_usdt": raw_usdt,
+        "size": size,
+        "quantity": quantity,
+        "option_roundtrip_fee_ticks": (
+            option_roundtrip_fee / node.tick if option_roundtrip_fee is not None else None
+        ),
+        "hedge_roundtrip_fee_ticks": (
+            hedge_roundtrip_fee / node.tick if hedge_roundtrip_fee is not None else None
+        ),
+        "net_ticks": net_points / node.tick if net_points is not None else None,
+        "net_usdt": net_usdt,
+        "expiry_net_usdt": (
+            expiry_net_points * quantity if expiry_net_points is not None else None
+        ),
+        "capital_est_usdt": capital,
+        "return_bps": (
+            net_usdt / capital * 10_000
+            if net_usdt is not None and capital is not None and capital > 0
+            else None
+        ),
+        "fees_complete": fully_costed,
+    }
 
 
 def pair_mid_iv(
@@ -497,12 +671,26 @@ def find_candidates(
                     continue
                 zscore = iv_edge / denominator
                 gross_edge_ticks = price_edge / node.tick
-                net_edge_ticks = gross_edge_ticks - args.cost_ticks
+                open_fee = option_trade_fee_per_underlying(node, price)
+                single_fee_ticks = (
+                    2 * open_fee / node.tick
+                    if open_fee is not None
+                    else None
+                )
+                net_edge_ticks = gross_edge_ticks
+                if single_fee_ticks is not None:
+                    net_edge_ticks -= single_fee_ticks
                 if zscore < args.min_z or net_edge_ticks < args.min_edge_ticks:
                     continue
-                parity = executable_parity_edge(node, signal, nodes_by_key)
-                parity_edge_ticks = parity[0] if parity else None
-                parity_size = parity[1] if parity else None
+                parity = executable_parity_metrics(
+                    node,
+                    signal,
+                    nodes_by_key,
+                    hedge_taker_rate=args.hedge_taker_rate,
+                    hedge_leverage=args.hedge_leverage,
+                )
+                parity_edge_ticks = parity["raw_ticks"] if parity else None
+                parity_size = parity["size"] if parity else None
                 vega_ticks_per_pp = (
                     black_forward_vega(
                         node.forward, node.strike, years, local_iv, node.discount
@@ -522,6 +710,19 @@ def find_candidates(
                     forward_move_bps = (node.forward / state.start_forward - 1) * 10_000
                 score = zscore * math.sqrt(max(net_edge_ticks, 0.0)) * math.log1p(size)
                 pair_iv = pair_mid_iv(node, nodes_by_key)
+                single_quantity = size * node.contract_multiplier
+                single_gross_usdt = gross_edge_ticks * node.tick * single_quantity
+                single_fee_usdt = (
+                    single_fee_ticks * node.tick * single_quantity
+                    if single_fee_ticks is not None
+                    else None
+                )
+                single_net_usdt = net_edge_ticks * node.tick * single_quantity
+                single_capital = (
+                    price * single_quantity
+                    if signal == "BUY"
+                    else short_option_initial_margin(node, size)
+                )
                 candidates.append(
                     {
                         "instrument": node.instrument,
@@ -538,7 +739,32 @@ def find_candidates(
                         "fair_price": fair_price,
                         "gross_edge_ticks": gross_edge_ticks,
                         "net_edge_ticks": net_edge_ticks,
+                        "single_fee_ticks": single_fee_ticks,
+                        "single_gross_usdt": single_gross_usdt,
+                        "single_fee_usdt": single_fee_usdt,
+                        "single_net_usdt": single_net_usdt,
+                        "single_capital_est_usdt": single_capital,
+                        "single_return_bps": (
+                            single_net_usdt / single_capital * 10_000
+                            if single_capital is not None and single_capital > 0
+                            else None
+                        ),
                         "parity_edge_ticks": parity_edge_ticks,
+                        "parity_net_ticks": parity["net_ticks"] if parity else None,
+                        "parity_raw_usdt": parity["raw_usdt"] if parity else None,
+                        "parity_net_usdt": parity["net_usdt"] if parity else None,
+                        "parity_expiry_net_usdt": parity["expiry_net_usdt"] if parity else None,
+                        "parity_option_fee_ticks": (
+                            parity["option_roundtrip_fee_ticks"] if parity else None
+                        ),
+                        "parity_hedge_fee_ticks": (
+                            parity["hedge_roundtrip_fee_ticks"] if parity else None
+                        ),
+                        "parity_capital_est_usdt": (
+                            parity["capital_est_usdt"] if parity else None
+                        ),
+                        "parity_return_bps": parity["return_bps"] if parity else None,
+                        "parity_fees_complete": parity["fees_complete"] if parity else False,
                         "parity_size": parity_size,
                         "vega_ticks_per_pp": vega_ticks_per_pp,
                         "time_value": price - intrinsic,
@@ -676,7 +902,22 @@ def find_candidates(
                     "fair_price": fair_price,
                     "gross_edge_ticks": gross_edge_ticks,
                     "net_edge_ticks": net_edge_ticks,
+                    "single_fee_ticks": None,
+                    "single_gross_usdt": None,
+                    "single_fee_usdt": None,
+                    "single_net_usdt": None,
+                    "single_capital_est_usdt": None,
+                    "single_return_bps": None,
                     "parity_edge_ticks": None,
+                    "parity_net_ticks": None,
+                    "parity_raw_usdt": None,
+                    "parity_net_usdt": None,
+                    "parity_expiry_net_usdt": None,
+                    "parity_option_fee_ticks": None,
+                    "parity_hedge_fee_ticks": None,
+                    "parity_capital_est_usdt": None,
+                    "parity_return_bps": None,
+                    "parity_fees_complete": False,
                     "parity_size": None,
                     "vega_ticks_per_pp": None,
                     "time_value": None,
@@ -740,16 +981,32 @@ def one_tick_rows(
     )
 
 
-def is_p1_local(row: Dict[str, Any], args: Any) -> bool:
+def is_local_net(row: Dict[str, Any], args: Any) -> bool:
     return bool(
         row.get("basis") == "LOCAL"
-        and row.get("parity_edge_ticks") is not None
-        and row["parity_edge_ticks"] >= args.min_parity_edge_ticks
-        and row.get("parity_size") is not None
-        and row["parity_size"] >= args.min_size
+        and row.get("net_edge_ticks") is not None
+        and row["net_edge_ticks"] >= args.min_edge_ticks
+        and row.get("size") is not None
+        and row["size"] >= args.min_size
         and row.get("vega_ticks_per_pp") is not None
         and row["vega_ticks_per_pp"] >= args.min_vega_ticks_per_pp
     )
+
+
+def is_pcp_net(row: Dict[str, Any], args: Any) -> bool:
+    return bool(
+        is_local_net(row, args)
+        and row.get("parity_fees_complete")
+        and row.get("parity_net_ticks") is not None
+        and row["parity_net_ticks"] >= args.min_parity_edge_ticks
+        and row.get("parity_size") is not None
+        and row["parity_size"] >= args.min_size
+    )
+
+
+def is_p1_local(row: Dict[str, Any], args: Any) -> bool:
+    """Backward-compatible name: P1 now includes fee-positive LOCAL reversion."""
+    return is_local_net(row, args)
 
 
 def text(value: Any, digits: int = 4) -> str:
@@ -784,18 +1041,32 @@ def print_candidate_section(
     print(f"\n{title}: {len(rows)}（显示前 {len(shown)}）")
     print_table(
         (
-            "venue", "instrument", "signal", "basis", "1tick", "price", "size",
-            "quote_iv%", "ref_iv%", "iv_edge_pp", "net_ticks", "parity_ticks",
-            "pair_size", "vega_t/pp", "D", "mark", "score",
+            "venue", "instrument", "mode", "signal", "1tick", "price", "size",
+            "quote_iv%", "ref_iv%", "iv_edge_pp", "local_gross_$", "fee_2x_$",
+            "local_net_$", "local_net_t",
+            "pcp_gross_t", "pcp_net_t", "pcp_net_$", "pair_size",
+            "capital_$", "ret_bp", "mark", "score",
         ),
         [
             (
-                row["venue"], row["instrument"], row["signal"], row["basis"],
+                row["venue"], row["instrument"], row.get("mode", "LOCAL_NET"), row["signal"],
                 row.get("one_tick", "-"), row["price"], row["size"],
                 row["quote_iv"] * 100, row["local_iv"] * 100, row["iv_edge_pp"],
-                row["net_edge_ticks"], row.get("parity_edge_ticks"),
-                row.get("parity_size"), row.get("vega_ticks_per_pp"),
-                row.get("discount"), row["mark"], row["score"],
+                row.get("single_gross_usdt"), row.get("single_fee_usdt"),
+                row.get("single_net_usdt"), row["net_edge_ticks"],
+                row.get("parity_edge_ticks"), row.get("parity_net_ticks"),
+                row.get("parity_net_usdt"), row.get("parity_size"),
+                (
+                    row.get("parity_capital_est_usdt")
+                    if row.get("mode") == "PCP_NET"
+                    else row.get("single_capital_est_usdt")
+                ),
+                (
+                    row.get("parity_return_bps")
+                    if row.get("mode") == "PCP_NET"
+                    else row.get("single_return_bps")
+                ),
+                row["mark"], row["score"],
             )
             for row in shown
         ],

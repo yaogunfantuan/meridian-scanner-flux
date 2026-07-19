@@ -22,6 +22,10 @@ import scanner_http
 VENUES = ("derive", "bybit", "gate")
 LABELS = {"derive": "Derive", "bybit": "Bybit", "gate": "Gate.io"}
 BYBIT_OPTION_COINS = ("BTC", "ETH", "SOL", "MNT", "XRP", "DOGE", "XAUT")
+BYBIT_OPTION_TAKER_FEE = 0.0003
+BYBIT_OPTION_FEE_CAP = 0.07
+BYBIT_OPTION_SETTLEMENT_FEE = {"BTC": 0.00015, "ETH": 0.00015}
+BYBIT_OPTION_ALT_SETTLEMENT_FEE = 0.0002
 DERIVE_API = "https://api.lyra.finance"
 BYBIT_API = "https://api.bybit.com"
 GATE_API = "https://api.gateio.ws/api/v4"
@@ -196,6 +200,10 @@ def derive_parse_tickers(
                     mark_iv=fnum(ticker_value(pricing, "iv", "i")),
                     forward=fnum(ticker_value(pricing, "forward_price", "f")),
                     discount=fnum(ticker_value(pricing, "discount_factor", "df")) or 1.0,
+                    index_price=fnum(ticker_value(ticker, "index_price", "I")),
+                    contract_multiplier=1.0,
+                    taker_fee_rate=fnum(meta.get("taker_fee_rate")),
+                    trade_fee_cap_rate=fnum(meta.get("mark_price_fee_rate_cap")),
                 )
             )
     return nodes
@@ -391,6 +399,14 @@ def load_bybit_snapshot(
                     mark_iv=fnum(ticker.get("markIv")),
                     forward=fnum(ticker.get("underlyingPrice")),
                     discount=1.0,
+                    index_price=fnum(ticker.get("indexPrice")),
+                    contract_multiplier=1.0,
+                    taker_fee_rate=BYBIT_OPTION_TAKER_FEE,
+                    trade_fee_cap_rate=BYBIT_OPTION_FEE_CAP,
+                    settlement_fee_rate=BYBIT_OPTION_SETTLEMENT_FEE.get(
+                        coin, BYBIT_OPTION_ALT_SETTLEMENT_FEE
+                    ),
+                    settlement_fee_cap_rate=0.125,
                 )
             )
         return nodes, len(current)
@@ -457,6 +473,14 @@ def load_gate_snapshot(
                     mark_iv=fnum(ticker.get("mark_iv")),
                     forward=fnum(ticker.get("underlying_price")),
                     discount=1.0,
+                    index_price=fnum(ticker.get("index_price")),
+                    contract_multiplier=fnum(meta.get("multiplier")) or 1.0,
+                    taker_fee_rate=fnum(meta.get("taker_fee_rate")),
+                    trade_fee_cap_rate=fnum(meta.get("price_limit_fee_rate")),
+                    settlement_fee_rate=fnum(meta.get("settle_fee_rate")),
+                    settlement_fee_cap_rate=fnum(meta.get("settle_limit_fee_rate")),
+                    initial_margin_low=fnum(meta.get("init_margin_low")),
+                    initial_margin_high=fnum(meta.get("init_margin_high")),
                 )
             )
         return nodes, len(current)

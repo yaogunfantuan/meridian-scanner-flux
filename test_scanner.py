@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -49,21 +50,53 @@ class ScannerCoreTests(unittest.TestCase):
         self.assertEqual(rows[0]["side"], "BUY")
         self.assertEqual(rows[0]["confirmation"], "LOCAL")
 
-    def test_p1_requires_parity_size_and_vega(self) -> None:
+    def test_local_net_survives_when_pcp_is_not_profitable(self) -> None:
         args = SimpleNamespace(
+            min_edge_ticks=5.0,
             min_parity_edge_ticks=1.0,
             min_size=1.0,
             min_vega_ticks_per_pp=1.0,
         )
         row = {
             "basis": "LOCAL",
-            "parity_edge_ticks": 2.0,
+            "net_edge_ticks": 8.0,
+            "size": 5.0,
+            "parity_fees_complete": True,
+            "parity_net_ticks": -1.0,
             "parity_size": 5.0,
             "vega_ticks_per_pp": 3.0,
         }
         self.assertTrue(core.is_p1_local(row, args))
-        row["parity_edge_ticks"] = -1.0
-        self.assertFalse(core.is_p1_local(row, args))
+        self.assertFalse(core.is_pcp_net(row, args))
+
+    def test_pcp_roundtrip_deducts_options_and_hedge_taker_fees(self) -> None:
+        call = replace(
+            node("TEST-C", 90, "C", 11.7, 11.8),
+            index_price=100.0,
+            taker_fee_rate=0.001,
+            trade_fee_cap_rate=1.0,
+        )
+        put = replace(
+            node("TEST-P", 90, "P", 2.0, 2.1),
+            index_price=100.0,
+            taker_fee_rate=0.001,
+            trade_fee_cap_rate=1.0,
+        )
+        lookup = {
+            (item.underlying, item.expiry, item.strike, item.option_type): item
+            for item in (call, put)
+        }
+        metrics = core.executable_parity_metrics(
+            put,
+            "SELL",
+            lookup,
+            hedge_taker_rate=0.0005,
+            hedge_leverage=10.0,
+        )
+        self.assertIsNotNone(metrics)
+        self.assertAlmostEqual(metrics["raw_ticks"], 2.0)  # type: ignore[index]
+        self.assertAlmostEqual(metrics["net_ticks"], -3.0)  # type: ignore[index]
+        self.assertTrue(metrics["fees_complete"])  # type: ignore[index]
 
     def test_put_call_calibration_recovers_forward_and_discount(self) -> None:
         nodes = []

@@ -16,11 +16,31 @@ scanner_http.py          gzip 响应解压与流量统计
 
 ## 信号分类
 
-- `P1`：LOCAL 曲面存在可成交优势，并得到 Put-Call Parity、配对数量和 Vega 门槛确认。
+- `PCP_NET`：LOCAL 曲面存在优势，且同执行价 Call/Put 的可成交 Put-Call Parity
+  在扣除两条期权开平 Taker 费和 Delta 对冲开平费后仍为正。这是优先级最高的组合信号。
+- `LOCAL_NET`：目标合约自身相对 leave-one-strike-out 局部曲面存在优势，手续费按当前
+  这笔成交的 Taker 费乘 2（进场一次、退出一次）后仍为正。另一侧
+  Call/Put 报价不会否决它；这是等待报价恢复的
+  单腿回归信号，不等同于无风险套利。
 - `1-tick`：最佳 ask 与 bid 相差恰好一个最小价格单位；仅当具有 LOCAL 方向或至少偏离
   mark 5 ticks 时进入提醒。
-- P1 不要求价差为 1 tick。同时满足两者的合约只在 P1 中显示，并标记 `1tick=True`。
+- 可执行候选不要求价差为 1 tick。同时满足两者的合约只在候选表中显示，并标记
+  `1tick=True`。
 - mark 只作为辅助诊断，不单独充当 P1 公允价值。
+
+期权手续费优先使用交易所公开合约字段；Bybit 使用公开的非 VIP 期权费率与费率上限。
+`PCP_NET` 的 Delta 对冲默认按往返 Taker 0.05% 估算，可按账户实际费率修改：
+
+```bash
+python3 option_alert_daemon.py --hedge-taker-rate 0.0003 --hedge-leverage 10
+```
+
+单腿输出将 `local_gross_$`、`fee_2x_$` 和 `local_net_$` 分列，便于同时观察
+曲面回归毛空间与成本。`pcp_net_$` 是完整组合按当前可成交数量计算的手续费后金额；`capital_$`
+是普通保证金口径的保守估算，`ret_bp` 是单次净收益/估算资金占用。组合保证金取决于账户
+现有仓位，扫描器不会把公共行情推导出的估值冒充真实账户保证金。资金费未来路径未知，
+因此不进入 `PCP_NET` 硬过滤，也不输出误导性的固定年化；短线回归应使用实际持仓时长，
+到期策略则应另行加入匹配期限的对冲和融资成本。
 
 ## 单轮扫描
 
