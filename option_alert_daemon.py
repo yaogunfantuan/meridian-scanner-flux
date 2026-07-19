@@ -168,6 +168,7 @@ def scan_nodes(
     p1_rows.sort(
         key=lambda row: (
             row["mode"] == "PCP_NET",
+            not bool(row.get("quality_flags")),
             (
                 row.get("parity_net_usdt")
                 if row["mode"] == "PCP_NET"
@@ -252,9 +253,14 @@ def format_feishu_message(
                     f"费×2 {row['single_fee_usdt']:.2f}；"
                     f"净 {row['single_net_usdt']:.2f} USDT"
                 )
+            quality = (
+                f"；风险 {','.join(row['quality_flags'])}"
+                if row.get("quality_flags")
+                else ""
+            )
             lines.append(
                 f"{row['venue']} {row['instrument']} {row['signal']} @ {row['price']:g} "
-                f"× {row['size']:g}；{row['mode']}；{detail}{one_tick}"
+                f"× {row['size']:g}；{row['mode']}；{detail}{quality}{one_tick}"
             )
     if tick_rows:
         remaining = max(limit - min(len(p1_rows), limit), 0)
@@ -318,8 +324,32 @@ def add_scan_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--neighbors", type=int, default=3)
     parser.add_argument("--min-neighbors", type=int, default=4)
     parser.add_argument("--allow-one-sided", action="store_true")
+    parser.add_argument(
+        "--max-neighbor-log-distance",
+        type=float,
+        default=0.20,
+        help="LOCAL参考点距目标log(K/F)的最大距离，默认0.20",
+    )
+    parser.add_argument(
+        "--max-bracket-log-span",
+        type=float,
+        default=0.30,
+        help="LOCAL最近左右参考点的最大log(K/F)跨度，默认0.30",
+    )
     parser.add_argument("--max-reference-iv-width", type=float, default=0.20)
     parser.add_argument("--min-reference-depth", type=float, default=0.1)
+    parser.add_argument(
+        "--pair-iv-tolerance",
+        type=float,
+        default=0.005,
+        help="同执行价另一种期权IV冲突容忍度，默认0.5个百分点",
+    )
+    parser.add_argument(
+        "--min-exit-depth",
+        type=float,
+        default=0.1,
+        help="低于该当前退出侧深度时标记EXIT_THIN，默认0.1",
+    )
     parser.add_argument("--min-size", type=float, default=1.0)
     parser.add_argument("--min-iv-edge", type=float, default=0.01)
     parser.add_argument("--min-z", type=float, default=3.0)
@@ -372,6 +402,10 @@ def parse_args() -> argparse.Namespace:
         parser.error("workers 至少为 1，rate-limit 必须在 0 到 10 之间")
     if args.hedge_taker_rate < 0 or args.hedge_leverage <= 0:
         parser.error("hedge-taker-rate 不能小于 0，hedge-leverage 必须大于 0")
+    if args.max_neighbor_log_distance <= 0 or args.max_bracket_log_span <= 0:
+        parser.error("LOCAL邻居距离和左右跨度必须大于 0")
+    if args.pair_iv_tolerance < 0 or args.min_exit_depth < 0:
+        parser.error("pair-iv-tolerance 和 min-exit-depth 不能小于 0")
     if args.notify and not os.environ.get("FEISHU_WEBHOOK_URL"):
         parser.error("--notify 需要环境变量 FEISHU_WEBHOOK_URL")
     return args
@@ -436,6 +470,7 @@ def main() -> int:
             p1_rows.sort(
                 key=lambda row: (
                     row["mode"] == "PCP_NET",
+                    not bool(row.get("quality_flags")),
                     (
                         row.get("parity_net_usdt")
                         if row["mode"] == "PCP_NET"

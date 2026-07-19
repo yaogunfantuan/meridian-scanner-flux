@@ -22,6 +22,12 @@ scanner_http.py          gzip 响应解压与流量统计
   这笔成交的 Taker 费乘 2（进场一次、退出一次）后仍为正。另一侧
   Call/Put 报价不会否决它；这是等待报价恢复的
   单腿回归信号，不等同于无风险套利。
+- LOCAL 拟合默认只使用距离目标 `log(K/F)` 不超过 `0.20` 的参考点，并要求最近左右
+  参考点跨度不超过 `0.30`。不满足时视为稀疏曲面，不生成 LOCAL 候选，避免跨越大段
+  无流动性执行价做直线插值。
+- `quality=PAIR_CONFLICT` 表示同执行价另一种期权的 IV 不支持当前方向；
+  `quality=EXIT_THIN` 表示当前反向盘口深度不足。两者只降低单腿回归置信度，不会用
+  对侧期权否决 LOCAL，也不会改变 PCP 的价格计算。
 - `1-tick`：最佳 ask 与 bid 相差恰好一个最小价格单位；仅当具有 LOCAL 方向或至少偏离
   mark 5 ticks 时进入提醒。
 - 可执行候选不要求价差为 1 tick。同时满足两者的合约只在候选表中显示，并标记
@@ -33,6 +39,16 @@ scanner_http.py          gzip 响应解压与流量统计
 
 ```bash
 python3 option_alert_daemon.py --hedge-taker-rate 0.0003 --hedge-leverage 10
+```
+
+LOCAL 稀疏度与质量门槛也可以按市场调整：
+
+```bash
+python3 option_alert_daemon.py \
+  --max-neighbor-log-distance 0.20 \
+  --max-bracket-log-span 0.30 \
+  --pair-iv-tolerance 0.005 \
+  --min-exit-depth 0.1
 ```
 
 单腿输出将 `local_gross_$`、`fee_2x_$` 和 `local_net_$` 分列，便于同时观察

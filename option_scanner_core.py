@@ -226,16 +226,34 @@ def weighted_local_fit(
     neighbors_each_side: int,
     min_neighbors: int,
     allow_one_sided: bool,
+    max_neighbor_distance: float | None = None,
+    max_bracket_span: float | None = None,
 ) -> Tuple[float, float, List[ReferencePoint]] | None:
     left = sorted((point for point in points if point.x < x0), key=lambda p: x0 - p.x)
     right = sorted((point for point in points if point.x > x0), key=lambda p: p.x - x0)
+    if max_neighbor_distance is not None:
+        left = [point for point in left if x0 - point.x <= max_neighbor_distance]
+        right = [point for point in right if point.x - x0 <= max_neighbor_distance]
     if not allow_one_sided and (not left or not right):
+        return None
+    if (
+        left
+        and right
+        and max_bracket_span is not None
+        and right[0].x - left[0].x > max_bracket_span
+    ):
         return None
     selected = left[:neighbors_each_side] + right[:neighbors_each_side]
     if len(selected) < min_neighbors:
         if not allow_one_sided:
             return None
-        selected = sorted(points, key=lambda point: abs(point.x - x0))[:min_neighbors]
+        eligible = points
+        if max_neighbor_distance is not None:
+            eligible = [
+                point for point in points
+                if abs(point.x - x0) <= max_neighbor_distance
+            ]
+        selected = sorted(eligible, key=lambda point: abs(point.x - x0))[:min_neighbors]
     if len(selected) < 2:
         return None
 
@@ -518,6 +536,31 @@ def pair_mid_iv(
     return other.mid_iv if other else None
 
 
+def local_quality_flags(
+    node: Node,
+    signal: str,
+    quote_iv: float,
+    paired_iv: float | None,
+    pair_iv_tolerance: float,
+    min_exit_depth: float,
+) -> List[str]:
+    """Return non-blocking warnings for a single-leg mean-reversion signal."""
+    flags: List[str] = []
+    if paired_iv is not None:
+        pair_conflicts = (
+            signal == "BUY" and paired_iv < quote_iv - pair_iv_tolerance
+        ) or (
+            signal == "SELL" and paired_iv > quote_iv + pair_iv_tolerance
+        )
+        if pair_conflicts:
+            flags.append("PAIR_CONFLICT")
+
+    exit_depth = node.bid_size if signal == "BUY" else node.ask_size
+    if exit_depth is None or exit_depth < min_exit_depth:
+        flags.append("EXIT_THIN")
+    return flags
+
+
 def neighbor_text(points: Sequence[ReferencePoint]) -> str:
     return ",".join(
         f"{point.option_type}{point.strike:g}:{point.iv * 100:.2f}%"
@@ -634,6 +677,8 @@ def find_candidates(
                 neighbors_each_side=args.neighbors,
                 min_neighbors=args.min_neighbors,
                 allow_one_sided=args.allow_one_sided,
+                max_neighbor_distance=args.max_neighbor_log_distance,
+                max_bracket_span=args.max_bracket_log_span,
             )
             if fit is None:
                 fit_info[node.instrument] = None
@@ -710,6 +755,22 @@ def find_candidates(
                     forward_move_bps = (node.forward / state.start_forward - 1) * 10_000
                 score = zscore * math.sqrt(max(net_edge_ticks, 0.0)) * math.log1p(size)
                 pair_iv = pair_mid_iv(node, nodes_by_key)
+                quality_flags = local_quality_flags(
+                    node,
+                    signal,
+                    quote_iv,
+                    pair_iv,
+                    args.pair_iv_tolerance,
+                    args.min_exit_depth,
+                )
+                left_neighbors = [point for point in neighbors if point.x < x0]
+                right_neighbors = [point for point in neighbors if point.x > x0]
+                bracket_log_span = (
+                    min(point.x for point in right_neighbors)
+                    - max(point.x for point in left_neighbors)
+                    if left_neighbors and right_neighbors
+                    else None
+                )
                 single_quantity = size * node.contract_multiplier
                 single_gross_usdt = gross_edge_ticks * node.tick * single_quantity
                 single_fee_usdt = (
@@ -771,6 +832,13 @@ def find_candidates(
                         "forward": node.forward,
                         "discount": node.discount,
                         "pair_iv": pair_iv,
+                        "quality": "+".join(quality_flags) if quality_flags else "OK",
+                        "quality_flags": quality_flags,
+                        "exit_depth": node.bid_size if signal == "BUY" else node.ask_size,
+                        "neighbor_max_log_distance": max(
+                            abs(point.x - x0) for point in neighbors
+                        ),
+                        "bracket_log_span": bracket_log_span,
                         "mark": node.mark,
                         "mark_iv": node.mark_iv,
                         "unchanged_s": unchanged_seconds,
@@ -924,6 +992,11 @@ def find_candidates(
                     "forward": node.forward,
                     "discount": node.discount,
                     "pair_iv": pair_mid_iv(node, nodes_by_key),
+                    "quality": "MARK_ONLY",
+                    "quality_flags": [],
+                    "exit_depth": None,
+                    "neighbor_max_log_distance": None,
+                    "bracket_log_span": None,
                     "mark": node.mark,
                     "mark_iv": node.mark_iv,
                     "unchanged_s": unchanged_seconds,
@@ -1041,7 +1114,7 @@ def print_candidate_section(
     print(f"\n{title}: {len(rows)}（显示前 {len(shown)}）")
     print_table(
         (
-            "venue", "instrument", "mode", "signal", "1tick", "price", "size",
+            "venue", "instrument", "mode", "quality", "signal", "1tick", "price", "size",
             "quote_iv%", "ref_iv%", "iv_edge_pp", "local_gross_$", "fee_2x_$",
             "local_net_$", "local_net_t",
             "pcp_gross_t", "pcp_net_t", "pcp_net_$", "pair_size",
@@ -1049,7 +1122,8 @@ def print_candidate_section(
         ),
         [
             (
-                row["venue"], row["instrument"], row.get("mode", "LOCAL_NET"), row["signal"],
+                row["venue"], row["instrument"], row.get("mode", "LOCAL_NET"),
+                row.get("quality", "-"), row["signal"],
                 row.get("one_tick", "-"), row["price"], row["size"],
                 row["quote_iv"] * 100, row["local_iv"] * 100, row["iv_edge_pp"],
                 row.get("single_gross_usdt"), row.get("single_fee_usdt"),
