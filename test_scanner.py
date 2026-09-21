@@ -109,6 +109,91 @@ class ScannerCoreTests(unittest.TestCase):
         self.assertAlmostEqual(metrics["net_ticks"], -3.0)  # type: ignore[index]
         self.assertTrue(metrics["fees_complete"])  # type: ignore[index]
 
+    def test_vertical_call_monotonicity_uses_executable_prices_and_fees(self) -> None:
+        low = replace(
+            node("TEST-90-C", 90, "C", 4.9, 5.0),
+            index_price=100.0,
+            taker_fee_rate=0.001,
+            trade_fee_cap_rate=1.0,
+        )
+        high = replace(
+            node("TEST-100-C", 100, "C", 5.5, 5.6),
+            index_price=100.0,
+            taker_fee_rate=0.001,
+            trade_fee_cap_rate=1.0,
+        )
+        rows = core.find_vertical_arbitrages(
+            [low, high], min_size=1.0, min_edge_ticks=1.0
+        )
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["violation"], "MONOTONIC")
+        self.assertEqual(rows[0]["long_instrument"], "TEST-90-C")
+        self.assertEqual(rows[0]["short_instrument"], "TEST-100-C")
+        self.assertAlmostEqual(rows[0]["net_edge_ticks"], 3.0)
+        self.assertAlmostEqual(rows[0]["net_usdt"], 3.0)
+
+    def test_vertical_call_width_cap_detects_credit_above_strike_width(self) -> None:
+        low = replace(
+            node("TEST-90-C", 90, "C", 11.5, 11.6),
+            index_price=100.0,
+            taker_fee_rate=0.001,
+            trade_fee_cap_rate=1.0,
+        )
+        high = replace(
+            node("TEST-100-C", 100, "C", 0.9, 1.0),
+            index_price=100.0,
+            taker_fee_rate=0.001,
+            trade_fee_cap_rate=1.0,
+        )
+        rows = core.find_vertical_arbitrages(
+            [low, high], min_size=1.0, min_edge_ticks=1.0
+        )
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["violation"], "WIDTH_CAP")
+        self.assertEqual(rows[0]["long_instrument"], "TEST-100-C")
+        self.assertEqual(rows[0]["short_instrument"], "TEST-90-C")
+        self.assertAlmostEqual(rows[0]["net_edge_ticks"], 3.0)
+
+    def test_vertical_put_monotonicity(self) -> None:
+        low = replace(
+            node("TEST-90-P", 90, "P", 5.5, 5.6),
+            index_price=100.0,
+            taker_fee_rate=0.001,
+            trade_fee_cap_rate=1.0,
+        )
+        high = replace(
+            node("TEST-100-P", 100, "P", 4.9, 5.0),
+            index_price=100.0,
+            taker_fee_rate=0.001,
+            trade_fee_cap_rate=1.0,
+        )
+        rows = core.find_vertical_arbitrages(
+            [low, high], min_size=1.0, min_edge_ticks=1.0
+        )
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["long_instrument"], "TEST-100-P")
+        self.assertEqual(rows[0]["short_instrument"], "TEST-90-P")
+
+    def test_vertical_normal_market_has_no_arbitrage(self) -> None:
+        low = replace(
+            node("TEST-90-C", 90, "C", 4.9, 5.0),
+            index_price=100.0,
+            taker_fee_rate=0.001,
+            trade_fee_cap_rate=1.0,
+        )
+        high = replace(
+            node("TEST-100-C", 100, "C", 2.9, 3.0),
+            index_price=100.0,
+            taker_fee_rate=0.001,
+            trade_fee_cap_rate=1.0,
+        )
+        self.assertEqual(
+            core.find_vertical_arbitrages(
+                [low, high], min_size=1.0, min_edge_ticks=1.0
+            ),
+            [],
+        )
+
     def test_local_fit_rejects_distant_sparse_bracket(self) -> None:
         points = [
             self.reference(-0.45, 0.60),

@@ -155,7 +155,12 @@ def scan_nodes(
     seconds: float,
     states: Dict[Tuple[str, str], core.QuoteState],
     args: argparse.Namespace,
-) -> Tuple[Dict[str, Any], List[Dict[str, Any]], List[Dict[str, Any]]]:
+) -> Tuple[
+    Dict[str, Any],
+    List[Dict[str, Any]],
+    List[Dict[str, Any]],
+    List[Dict[str, Any]],
+]:
     now = time.time()
     core.update_quote_states(nodes, states, now)
     candidates = core.find_candidates(nodes, states, args, now)
@@ -193,6 +198,13 @@ def scan_nodes(
         row["one_tick"] = (row["venue"], row["instrument"], row["signal"]) in one_tick_keys
     p1_keys = {(row["venue"], row["instrument"], row["signal"]) for row in p1_rows}
     tick_alerts = actionable_one_ticks(one_ticks, p1_keys, args.mark_fallback_ticks)
+    vertical_rows = core.find_vertical_arbitrages(
+        nodes,
+        min_size=args.min_size,
+        min_edge_ticks=args.min_vertical_edge_ticks,
+    )
+    for row in vertical_rows:
+        row["venue"] = label
     summary = {
         "venue": label,
         "active": active,
@@ -201,11 +213,33 @@ def scan_nodes(
         "p1": len(p1_rows),
         "pcp_net": sum(row["mode"] == "PCP_NET" for row in p1_rows),
         "local_net": sum(row["mode"] == "LOCAL_NET" for row in p1_rows),
+        "vertical_net": len(vertical_rows),
         "one_tick_alerts": len(tick_alerts),
         "one_tick_all": len(one_ticks),
         "seconds": seconds,
     }
-    return summary, p1_rows, tick_alerts
+    return summary, p1_rows, vertical_rows, tick_alerts
+
+
+def print_vertical_alerts(rows: Sequence[Dict[str, Any]], limit: int) -> None:
+    shown = list(rows[:limit])
+    print(f"\n垂直价差套利 VERTICAL_NET: {len(rows)}（显示前 {len(shown)}）")
+    core.print_table(
+        (
+            "venue", "type", "violation", "long", "long_ask", "short",
+            "short_bid", "size", "width", "credit", "fee_$", "net_$", "net_t",
+        ),
+        [
+            (
+                row["venue"], row["option_type"], row["violation"],
+                row["long_instrument"], row["long_price"],
+                row["short_instrument"], row["short_price"], row["size"],
+                row["strike_width"], row["entry_credit"], row["fee_usdt"],
+                row["net_usdt"], row["net_edge_ticks"],
+            )
+            for row in shown
+        ],
+    )
 
 
 def print_tick_alerts(rows: Sequence[Dict[str, Any]], limit: int) -> None:
@@ -361,6 +395,12 @@ def add_scan_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--mark-regime-min-points", type=int, default=4)
     parser.add_argument("--mark-regime-min-bias", type=float, default=0.02)
     parser.add_argument("--min-parity-edge-ticks", type=float, default=1.0)
+    parser.add_argument(
+        "--min-vertical-edge-ticks",
+        type=float,
+        default=1.0,
+        help="垂直价差扣双腿开仓费后的最小无套利空间，默认1 tick",
+    )
     parser.add_argument("--min-vega-ticks-per-pp", type=float, default=1.0)
     parser.add_argument(
         "--hedge-taker-rate",
@@ -455,16 +495,18 @@ def main() -> int:
 
             summaries: List[Dict[str, Any]] = []
             p1_rows: List[Dict[str, Any]] = []
+            vertical_rows: List[Dict[str, Any]] = []
             tick_rows: List[Dict[str, Any]] = []
             for venue in venues:
                 if venue not in snapshots:
                     continue
                 nodes, active, seconds = snapshots[venue]
-                summary, current_p1, current_ticks = scan_nodes(
+                summary, current_p1, current_verticals, current_ticks = scan_nodes(
                     venue, nodes, active, seconds, states[venue], args
                 )
                 summaries.append(summary)
                 p1_rows.extend(current_p1)
+                vertical_rows.extend(current_verticals)
                 tick_rows.extend(current_ticks)
 
             p1_rows.sort(
@@ -484,6 +526,10 @@ def main() -> int:
                 key=lambda row: (row["alert_basis"] == "LOCAL", row["mark_gap"], row["depth"]),
                 reverse=True,
             )
+            vertical_rows.sort(
+                key=lambda row: (row["net_usdt"], row["net_edge_ticks"]),
+                reverse=True,
+            )
             elapsed = time.time() - round_started
             catalog_bytes = after_catalog - before_catalog
             ticker_bytes = after_tickers - after_catalog
@@ -500,17 +546,19 @@ def main() -> int:
             core.print_table(
                 (
                     "venue", "active", "returned", "two_sided", "candidates",
-                    "PCP_NET", "LOCAL_NET", "1tick_alert", "1tick_all", "seconds",
+                    "VERTICAL_NET", "PCP_NET", "LOCAL_NET", "1tick_alert",
+                    "1tick_all", "seconds",
                 ),
                 [
                     (
                         row["venue"], row["active"], row["returned"], row["two_sided"],
-                        row["p1"], row["pcp_net"], row["local_net"],
+                        row["p1"], row["vertical_net"], row["pcp_net"], row["local_net"],
                         row["one_tick_alerts"], row["one_tick_all"], row["seconds"],
                     )
                     for row in summaries
                 ],
             )
+            print_vertical_alerts(vertical_rows, args.limit)
             core.print_candidate_section("手续费后可执行候选", p1_rows, args.limit)
             print_tick_alerts(tick_rows, args.limit)
 
@@ -522,6 +570,7 @@ def main() -> int:
                 "ticker_response_bytes": ticker_bytes,
                 "ticker_estimated_gib_day": estimated_gib_day,
                 "summaries": summaries,
+                "vertical_net": vertical_rows,
                 "p1": p1_rows,
                 "one_tick_alerts": tick_rows,
             }

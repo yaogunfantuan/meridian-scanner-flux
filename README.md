@@ -16,6 +16,10 @@ scanner_http.py          gzip 响应解压与流量统计
 
 ## 信号分类
 
+- `VERTICAL_NET`：同交易所、同标的、同到期日、同类型期权组成的垂直价差，使用真实
+  bid/ask 检查价格单调性以及价差价格不超过折现执行价宽度这两个静态无套利边界；仅在
+  扣除双腿开仓 Taker 费后仍至少剩余 1 tick 时输出。它不包含账户组合保证金、融资成本
+  和可能存在的到期结算费。
 - `PCP_NET`：LOCAL 曲面存在优势，且同执行价 Call/Put 的可成交 Put-Call Parity
   在扣除两条期权开平 Taker 费和 Delta 对冲开平费后仍为正。这是优先级最高的组合信号。
 - `LOCAL_NET`：目标合约自身相对 leave-one-strike-out 局部曲面存在优势，手续费按当前

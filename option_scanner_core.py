@@ -536,6 +536,111 @@ def pair_mid_iv(
     return other.mid_iv if other else None
 
 
+def find_vertical_arbitrages(
+    nodes: Sequence[Node],
+    min_size: float,
+    min_edge_ticks: float,
+) -> List[Dict[str, Any]]:
+    """Find executable same-expiry vertical spreads outside no-arbitrage bounds.
+
+    For two strikes K1 < K2, a call spread and a put spread must cost between
+    zero and D * (K2 - K1).  Both bounds are checked using executable bid/ask
+    prices.  Only opportunities that remain positive after both opening taker
+    fees are returned; expiry settlement fees and account margin are not
+    inferred here.
+    """
+    groups: Dict[Tuple[str, str, str], List[Node]] = defaultdict(list)
+    for node in nodes:
+        if node.option_type in ("C", "P"):
+            groups[(node.underlying, node.expiry, node.option_type)].append(node)
+
+    rows: List[Dict[str, Any]] = []
+    for (_underlying, _expiry, option_type), grouped in groups.items():
+        ordered = sorted(grouped, key=lambda item: item.strike)
+        for low_index, low in enumerate(ordered):
+            for high in ordered[low_index + 1 :]:
+                if high.strike <= low.strike:
+                    continue
+                multiplier = low.contract_multiplier
+                if multiplier <= 0 or not math.isclose(
+                    multiplier,
+                    high.contract_multiplier,
+                    rel_tol=1e-9,
+                    abs_tol=1e-12,
+                ):
+                    continue
+                tick = max(low.tick, high.tick)
+                if tick <= 0:
+                    continue
+                discounts = [
+                    value for value in (low.discount, high.discount) if value > 0
+                ]
+                if not discounts:
+                    continue
+                width_value = median(discounts) * (high.strike - low.strike)
+
+                if option_type == "C":
+                    strategies = (
+                        ("MONOTONIC", low, high, 0.0),
+                        ("WIDTH_CAP", high, low, width_value),
+                    )
+                else:
+                    strategies = (
+                        ("MONOTONIC", high, low, 0.0),
+                        ("WIDTH_CAP", low, high, width_value),
+                    )
+
+                for violation, long_node, short_node, max_liability in strategies:
+                    if (
+                        not long_node.valid_ask
+                        or not short_node.valid_bid
+                        or long_node.ask is None
+                        or short_node.bid is None
+                    ):
+                        continue
+                    size = min(long_node.ask_size or 0.0, short_node.bid_size or 0.0)
+                    if size < min_size:
+                        continue
+                    entry_credit = short_node.bid - long_node.ask
+                    raw_edge = entry_credit - max_liability
+                    long_fee = option_trade_fee_per_underlying(long_node, long_node.ask)
+                    short_fee = option_trade_fee_per_underlying(short_node, short_node.bid)
+                    if long_fee is None or short_fee is None:
+                        continue
+                    fee_points = long_fee + short_fee
+                    net_edge = raw_edge - fee_points
+                    net_ticks = net_edge / tick
+                    if net_ticks < min_edge_ticks:
+                        continue
+                    quantity = size * multiplier
+                    rows.append(
+                        {
+                            "underlying": low.underlying,
+                            "expiry": low.expiry,
+                            "option_type": option_type,
+                            "violation": violation,
+                            "long_instrument": long_node.instrument,
+                            "long_price": long_node.ask,
+                            "short_instrument": short_node.instrument,
+                            "short_price": short_node.bid,
+                            "size": size,
+                            "quantity": quantity,
+                            "strike_width": high.strike - low.strike,
+                            "entry_credit": entry_credit,
+                            "max_liability_pv": max_liability,
+                            "gross_edge_ticks": raw_edge / tick,
+                            "fee_usdt": fee_points * quantity,
+                            "net_edge_ticks": net_ticks,
+                            "net_usdt": net_edge * quantity,
+                        }
+                    )
+    return sorted(
+        rows,
+        key=lambda row: (row["net_usdt"], row["net_edge_ticks"]),
+        reverse=True,
+    )
+
+
 def local_quality_flags(
     node: Node,
     signal: str,
