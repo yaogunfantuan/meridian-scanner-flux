@@ -217,8 +217,8 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart="${RUNNER}"
-WorkingDirectory="${INSTALL_DIR}"
+ExecStart=${RUNNER}
+WorkingDirectory=${INSTALL_DIR}
 Restart=always
 RestartSec=10
 
