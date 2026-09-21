@@ -259,10 +259,10 @@ class ScannerCoreTests(unittest.TestCase):
         self.assertAlmostEqual(calibration["discount"], 1.0)
         self.assertTrue(all(item.forward == 100.0 for item in calibrated))
 
-    def test_feishu_signature_is_stable(self) -> None:
+    def test_dingtalk_signature_is_stable(self) -> None:
         self.assertEqual(
-            daemon.feishu_sign("1599360473", "test-secret"),
-            "wSds2BzzFIIGf/WrhUO+NI1q/9j+FRJd3JNHKAq0NZY=",
+            daemon.dingtalk_sign("1599360473000", "test-secret"),
+            "Mee7fHPnIHChjJIuEtxRUaKgA9a/2itMq8Jj5AtfVkc=",
         )
 
     def test_jsonl_log_rotates(self) -> None:
@@ -272,6 +272,31 @@ class ScannerCoreTests(unittest.TestCase):
                 daemon.append_log(path, {"index": index, "text": "x" * 700}, 0.001)
             self.assertTrue(path.exists())
             self.assertTrue(path.with_suffix(".jsonl.1").exists())
+
+    def test_alert_cooldown_suppresses_recovers_and_breaks_through(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            cooldown = daemon.AlertCooldown(Path(directory) / "cooldown.json", 900, 2, 0.30)
+            row = {
+                "venue": "Bybit",
+                "instrument": "ETH-C",
+                "side": "SELL",
+                "alert_basis": "MARK",
+                "mark_gap": 6.0,
+            }
+
+            self.assertEqual(cooldown.filter_ticks([row], 1000.0), [row])
+            cooldown.finish_round()
+
+            self.assertEqual(cooldown.filter_ticks([row], 1060.0), [])
+            cooldown.finish_round()
+
+            cooldown.finish_round()
+            cooldown.finish_round()
+            self.assertEqual(cooldown.filter_ticks([row], 1120.0), [row])
+            cooldown.finish_round()
+
+            stronger = dict(row, mark_gap=8.0)
+            self.assertEqual(cooldown.filter_ticks([stronger], 1180.0), [stronger])
 
 
 if __name__ == "__main__":

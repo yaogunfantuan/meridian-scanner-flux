@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""Periodic REST option-surface scans with optional Feishu alerts."""
+"""Periodic REST option-surface scans with optional DingTalk alerts."""
 
 from __future__ import annotations
 
 import argparse
 import base64
+import copy
 import hashlib
 import hmac
 import json
@@ -15,6 +16,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Sequence, Tuple
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 from urllib.request import Request, urlopen
 
 import exchange_adapters as adapters
@@ -23,6 +25,7 @@ import scanner_http
 
 
 CACHE_VERSION = 1
+ALERT_STATE_VERSION = 1
 
 
 class CatalogManager:
@@ -108,6 +111,138 @@ class CatalogManager:
             and entries[venue].get("data")
         }
         return available, refreshed
+
+
+class AlertCooldown:
+    """Persist notification cooldown state across scanner restarts."""
+
+    def __init__(
+        self,
+        path: Path,
+        cooldown_seconds: float,
+        recovery_misses: int,
+        breakthrough_ratio: float,
+    ) -> None:
+        self.path = path
+        self.cooldown_seconds = cooldown_seconds
+        self.recovery_misses = recovery_misses
+        self.breakthrough_ratio = breakthrough_ratio
+        self.items: Dict[str, Dict[str, Any]] = self._read()
+        self.seen_keys: set[str] = set()
+
+    def _read(self) -> Dict[str, Dict[str, Any]]:
+        try:
+            value = json.loads(self.path.read_text(encoding="utf-8"))
+            if value.get("version") == ALERT_STATE_VERSION and isinstance(value.get("items"), dict):
+                return value["items"]
+        except FileNotFoundError:
+            pass
+        except (OSError, ValueError, TypeError) as exc:
+            print(f"通知冷却状态不可用，将重建（{exc}）", file=sys.stderr)
+        return {}
+
+    def _write(self) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = self.path.with_suffix(self.path.suffix + ".tmp")
+        payload = {"version": ALERT_STATE_VERSION, "items": self.items}
+        temporary.write_text(
+            json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
+            encoding="utf-8",
+        )
+        os.replace(temporary, self.path)
+
+    @staticmethod
+    def p1_key(row: Dict[str, Any]) -> str:
+        return f"p1|{row['venue']}|{row['instrument']}|{row['mode']}|{row['signal']}"
+
+    @staticmethod
+    def tick_key(row: Dict[str, Any]) -> str:
+        return f"tick|{row['venue']}|{row['instrument']}|{row['side']}|{row['alert_basis']}"
+
+    @staticmethod
+    def vertical_key(row: Dict[str, Any]) -> str:
+        return (
+            f"vertical|{row['venue']}|{row['long_instrument']}|"
+            f"{row['short_instrument']}|{row['violation']}"
+        )
+
+    @staticmethod
+    def p1_strength(row: Dict[str, Any]) -> float:
+        if row["mode"] == "PCP_NET":
+            return max(float(row.get("parity_net_usdt") or 0.0), 0.0)
+        return max(float(row.get("single_net_usdt") or 0.0), 0.0)
+
+    @staticmethod
+    def tick_strength(row: Dict[str, Any]) -> float:
+        return max(float(row.get("mark_gap") or 0.0), 0.0)
+
+    @staticmethod
+    def vertical_strength(row: Dict[str, Any]) -> float:
+        return max(float(row.get("net_usdt") or 0.0), 0.0)
+
+    def _allows(self, key: str, strength: float, now: float) -> bool:
+        if self.cooldown_seconds <= 0:
+            return True
+        item = self.items.get(key)
+        if not item:
+            return True
+        sent_at = float(item.get("sent_at", 0.0))
+        if now - sent_at >= self.cooldown_seconds:
+            return True
+        if self.recovery_misses > 0 and int(item.get("misses", 0)) >= self.recovery_misses:
+            return True
+        previous_strength = float(item.get("strength", 0.0))
+        if previous_strength <= 0:
+            return strength > 0
+        return strength >= previous_strength * (1.0 + self.breakthrough_ratio)
+
+    def filter_p1(self, rows: Sequence[Dict[str, Any]], now: float) -> List[Dict[str, Any]]:
+        allowed: List[Dict[str, Any]] = []
+        for row in rows:
+            key = self.p1_key(row)
+            strength = self.p1_strength(row)
+            self.seen_keys.add(key)
+            if self._allows(key, strength, now):
+                allowed.append(row)
+                self.items[key] = {"sent_at": now, "strength": strength, "misses": 0}
+            elif key in self.items:
+                self.items[key]["misses"] = 0
+        return allowed
+
+    def filter_ticks(self, rows: Sequence[Dict[str, Any]], now: float) -> List[Dict[str, Any]]:
+        allowed: List[Dict[str, Any]] = []
+        for row in rows:
+            key = self.tick_key(row)
+            strength = self.tick_strength(row)
+            self.seen_keys.add(key)
+            if self._allows(key, strength, now):
+                allowed.append(row)
+                self.items[key] = {"sent_at": now, "strength": strength, "misses": 0}
+            elif key in self.items:
+                self.items[key]["misses"] = 0
+        return allowed
+
+    def filter_verticals(
+        self, rows: Sequence[Dict[str, Any]], now: float
+    ) -> List[Dict[str, Any]]:
+        allowed: List[Dict[str, Any]] = []
+        for row in rows:
+            key = self.vertical_key(row)
+            strength = self.vertical_strength(row)
+            self.seen_keys.add(key)
+            if self._allows(key, strength, now):
+                allowed.append(row)
+                self.items[key] = {"sent_at": now, "strength": strength, "misses": 0}
+            elif key in self.items:
+                self.items[key]["misses"] = 0
+        return allowed
+
+    def finish_round(self) -> None:
+        for key, item in self.items.items():
+            if key not in self.seen_keys:
+                item["misses"] = int(item.get("misses", 0)) + 1
+        self.seen_keys.clear()
+        self._write()
 
 
 def actionable_one_ticks(
@@ -259,9 +394,10 @@ def print_tick_alerts(rows: Sequence[Dict[str, Any]], limit: int) -> None:
     )
 
 
-def format_feishu_message(
+def format_dingtalk_message(
     stamp: str,
     p1_rows: Sequence[Dict[str, Any]],
+    vertical_rows: Sequence[Dict[str, Any]],
     tick_rows: Sequence[Dict[str, Any]],
     summaries: Sequence[Dict[str, Any]],
     elapsed: float,
@@ -269,12 +405,27 @@ def format_feishu_message(
     limit: int,
 ) -> str:
     lines = [
-        f"【期权曲面扫描】{stamp}",
+        f"【Scanner 期权曲面扫描】{stamp}",
         f"耗时 {elapsed:.1f}s；ticker {ticker_bytes / 1024 / 1024:.2f} MiB",
     ]
+    used = 0
+    if vertical_rows:
+        shown_verticals = list(vertical_rows[:limit])
+        used += len(shown_verticals)
+        lines.append(f"\n垂直价差套利：{len(vertical_rows)}")
+        for row in shown_verticals:
+            lines.append(
+                f"{row['venue']} {row['option_type']} {row['violation']}；"
+                f"买 {row['long_instrument']} @ {row['long_price']:g}；"
+                f"卖 {row['short_instrument']} @ {row['short_price']:g}；"
+                f"× {row['size']:g}；扣开仓费净 {row['net_usdt']:.2f} USDT"
+            )
     if p1_rows:
+        remaining = max(limit - used, 0)
+        shown_p1 = list(p1_rows[:remaining])
+        used += len(shown_p1)
         lines.append(f"\n手续费后可执行候选：{len(p1_rows)}")
-        for row in p1_rows[:limit]:
+        for row in shown_p1:
             one_tick = " [1-tick]" if row.get("one_tick") else ""
             if row["mode"] == "PCP_NET":
                 detail = (
@@ -297,49 +448,57 @@ def format_feishu_message(
                 f"× {row['size']:g}；{row['mode']}；{detail}{quality}{one_tick}"
             )
     if tick_rows:
-        remaining = max(limit - min(len(p1_rows), limit), 0)
+        remaining = max(limit - used, 0)
         lines.append(f"\n有效 1-tick 异常：{len(tick_rows)}")
         for row in tick_rows[:remaining]:
             price = row["ask"] if row["side"] == "BUY" else row["bid"]
             size = row["ask_size"] if row["side"] == "BUY" else row["bid_size"]
             lines.append(
                 f"{row['venue']} {row['instrument']} {row['side']} @ {price:g} × {size:g}；"
-                f"{row['alert_basis']}；mark差 {row['mark_gap']:.1f}t"
+                f"{row['alert_basis']}；mark {row['mark']:g}；mark差 {row['mark_gap']:.1f}t"
             )
     lines.append(
         "\n覆盖 "
         + "；".join(
             f"{row['venue']} {row['returned']}/{row['active']}，"
-            f"PCP {row['pcp_net']} / LOCAL {row['local_net']}"
+            f"VERTICAL {row['vertical_net']} / PCP {row['pcp_net']} / LOCAL {row['local_net']}"
             for row in summaries
         )
     )
     return "\n".join(lines)
 
 
-def feishu_sign(timestamp: str, secret: str) -> str:
-    key = f"{timestamp}\n{secret}".encode("utf-8")
-    digest = hmac.new(key, b"", digestmod=hashlib.sha256).digest()
+def dingtalk_sign(timestamp: str, secret: str) -> str:
+    string_to_sign = f"{timestamp}\n{secret}".encode("utf-8")
+    digest = hmac.new(secret.encode("utf-8"), string_to_sign, digestmod=hashlib.sha256).digest()
     return base64.b64encode(digest).decode("ascii")
 
 
-def send_feishu(webhook: str, secret: str | None, message: str) -> None:
-    payload: Dict[str, Any] = {"msg_type": "text", "content": {"text": message}}
-    if secret:
-        timestamp = str(int(time.time()))
-        payload["timestamp"] = timestamp
-        payload["sign"] = feishu_sign(timestamp, secret)
+def dingtalk_signed_webhook(webhook: str, secret: str | None) -> str:
+    if not secret:
+        return webhook
+    timestamp = str(int(time.time() * 1000))
+    parts = urlsplit(webhook)
+    query = dict(parse_qsl(parts.query, keep_blank_values=True))
+    query["timestamp"] = timestamp
+    query["sign"] = dingtalk_sign(timestamp, secret)
+    return urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(query), parts.fragment))
+
+
+def send_dingtalk(webhook: str, secret: str | None, message: str) -> None:
+    payload: Dict[str, Any] = {"msgtype": "text", "text": {"content": message}}
+    signed_webhook = dingtalk_signed_webhook(webhook, secret)
     request = Request(
-        webhook,
+        signed_webhook,
         data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
         headers={"Content-Type": "application/json; charset=utf-8"},
         method="POST",
     )
     with urlopen(request, timeout=15) as response:
         result = json.loads(response.read().decode("utf-8"))
-    code = result.get("code", result.get("StatusCode", 0))
+    code = result.get("errcode", result.get("code", result.get("StatusCode", 0)))
     if code not in (0, "0"):
-        raise RuntimeError(f"飞书返回错误：{result}")
+        raise RuntimeError(f"钉钉返回错误：{result}")
 
 
 def append_log(path: Path, record: Dict[str, Any], max_megabytes: float) -> None:
@@ -417,22 +576,26 @@ def add_scan_arguments(parser: argparse.ArgumentParser) -> None:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="每分钟用 REST 快照扫描期权曲面并可选推送飞书")
+    parser = argparse.ArgumentParser(description="每分钟用 REST 快照扫描期权曲面并可选推送钉钉")
     parser.add_argument("--exchange", choices=("all",) + adapters.VENUES, default="all")
     parser.add_argument("--underlying", type=str.upper)
     parser.add_argument("--interval", type=float, default=60.0)
     parser.add_argument("--catalog-ttl", type=float, default=21600.0)
     parser.add_argument("--cache", type=Path, default=Path("work/option_catalog.json"))
     parser.add_argument("--log", type=Path, default=Path("outputs/option_alerts.jsonl"))
+    parser.add_argument("--alert-state", type=Path, default=Path("outputs/option_alert_cooldown.json"))
     parser.add_argument("--max-log-mb", type=float, default=100.0)
     parser.add_argument("--no-log", action="store_true")
     parser.add_argument("--workers", type=int, default=8)
     parser.add_argument("--rate-limit", type=float, default=8.0)
     parser.add_argument("--limit", type=int, default=20)
-    parser.add_argument("--alert-limit", type=int, default=20)
+    parser.add_argument("--alert-limit", type=int, default=5)
+    parser.add_argument("--alert-cooldown-seconds", type=float, default=900.0)
+    parser.add_argument("--alert-recovery-misses", type=int, default=5)
+    parser.add_argument("--alert-breakthrough-ratio", type=float, default=0.30)
     parser.add_argument("--once", action="store_true")
     mode = parser.add_mutually_exclusive_group()
-    mode.add_argument("--notify", action="store_true", help="向飞书发送；默认只在终端输出")
+    mode.add_argument("--notify", action="store_true", help="向钉钉发送；默认只在终端输出")
     mode.add_argument("--dry-run", action="store_true", help="明确只在终端输出（默认行为）")
     add_scan_arguments(parser)
     args = parser.parse_args()
@@ -446,8 +609,14 @@ def parse_args() -> argparse.Namespace:
         parser.error("LOCAL邻居距离和左右跨度必须大于 0")
     if args.pair_iv_tolerance < 0 or args.min_exit_depth < 0:
         parser.error("pair-iv-tolerance 和 min-exit-depth 不能小于 0")
-    if args.notify and not os.environ.get("FEISHU_WEBHOOK_URL"):
-        parser.error("--notify 需要环境变量 FEISHU_WEBHOOK_URL")
+    if args.min_vertical_edge_ticks < 0:
+        parser.error("min-vertical-edge-ticks 不能小于 0")
+    if args.alert_cooldown_seconds < 0 or args.alert_recovery_misses < 0:
+        parser.error("alert-cooldown-seconds 和 alert-recovery-misses 不能小于 0")
+    if args.alert_breakthrough_ratio < 0:
+        parser.error("alert-breakthrough-ratio 不能小于 0")
+    if args.notify and not os.environ.get("DINGTALK_WEBHOOK_URL"):
+        parser.error("--notify 需要环境变量 DINGTALK_WEBHOOK_URL")
     return args
 
 
@@ -461,8 +630,14 @@ def main() -> int:
     states: Dict[str, Dict[Tuple[str, str], core.QuoteState]] = {
         venue: {} for venue in venues
     }
-    webhook = os.environ.get("FEISHU_WEBHOOK_URL", "")
-    secret = os.environ.get("FEISHU_WEBHOOK_SECRET")
+    webhook = os.environ.get("DINGTALK_WEBHOOK_URL", "")
+    secret = os.environ.get("DINGTALK_WEBHOOK_SECRET")
+    cooldown = AlertCooldown(
+        args.alert_state,
+        args.alert_cooldown_seconds,
+        args.alert_recovery_misses,
+        args.alert_breakthrough_ratio,
+    )
 
     try:
         while True:
@@ -577,18 +752,37 @@ def main() -> int:
             if not args.no_log:
                 append_log(args.log, record, args.max_log_mb)
 
-            if p1_rows or tick_rows:
-                message = format_feishu_message(
-                    stamp, p1_rows, tick_rows, summaries, elapsed, ticker_bytes, args.alert_limit
+            cooldown_snapshot: Dict[str, Dict[str, Any]] | None = None
+            if args.notify:
+                cooldown_snapshot = copy.deepcopy(cooldown.items)
+                filter_time = time.time()
+                notify_vertical_rows = cooldown.filter_verticals(vertical_rows, filter_time)
+                notify_p1_rows = cooldown.filter_p1(p1_rows, filter_time)
+                notify_tick_rows = cooldown.filter_ticks(tick_rows, filter_time)
+            else:
+                notify_vertical_rows = vertical_rows
+                notify_p1_rows = p1_rows
+                notify_tick_rows = tick_rows
+
+            if notify_vertical_rows or notify_p1_rows or notify_tick_rows:
+                message = format_dingtalk_message(
+                    stamp, notify_p1_rows, notify_vertical_rows, notify_tick_rows,
+                    summaries, elapsed, ticker_bytes, args.alert_limit
                 )
                 if args.notify:
                     try:
-                        send_feishu(webhook, secret, message)
-                        print("飞书：已发送 1 条合并提醒。")
+                        send_dingtalk(webhook, secret, message)
+                        print("钉钉：已发送 1 条合并提醒。")
                     except Exception as exc:
-                        print(f"飞书发送失败（{exc}）", file=sys.stderr)
+                        if cooldown_snapshot is not None:
+                            cooldown.items = cooldown_snapshot
+                        print(f"钉钉发送失败（{exc}）", file=sys.stderr)
                 else:
-                    print("飞书：dry-run，未发送。")
+                    print("钉钉：dry-run，未发送。")
+            elif vertical_rows or p1_rows or tick_rows:
+                print("钉钉：冷却节流后无新增/恢复/突破，未发送。")
+            if args.notify:
+                cooldown.finish_round()
 
             if args.once:
                 return 0 if summaries else 1

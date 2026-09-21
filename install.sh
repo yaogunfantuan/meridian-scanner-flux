@@ -161,7 +161,10 @@ fi
 : "${SCANNER_WORKERS:=8}"
 : "${SCANNER_RATE_LIMIT:=8}"
 : "${SCANNER_LIMIT:=20}"
-: "${SCANNER_ALERT_LIMIT:=20}"
+: "${SCANNER_ALERT_LIMIT:=5}"
+: "${SCANNER_ALERT_COOLDOWN_SECONDS:=900}"
+: "${SCANNER_ALERT_RECOVERY_MISSES:=5}"
+: "${SCANNER_ALERT_BREAKTHROUGH_RATIO:=0.30}"
 : "${SCANNER_MAX_LOG_MB:=100}"
 : "${SCANNER_NOTIFY:=0}"
 
@@ -173,11 +176,15 @@ ARGS=(
   --catalog-ttl "${SCANNER_CATALOG_TTL}"
   --cache "${STATE_DIR}/option_catalog.json"
   --log "${STATE_DIR}/option_alerts.jsonl"
+  --alert-state "${STATE_DIR}/option_alert_cooldown.json"
   --max-log-mb "${SCANNER_MAX_LOG_MB}"
   --workers "${SCANNER_WORKERS}"
   --rate-limit "${SCANNER_RATE_LIMIT}"
   --limit "${SCANNER_LIMIT}"
   --alert-limit "${SCANNER_ALERT_LIMIT}"
+  --alert-cooldown-seconds "${SCANNER_ALERT_COOLDOWN_SECONDS}"
+  --alert-recovery-misses "${SCANNER_ALERT_RECOVERY_MISSES}"
+  --alert-breakthrough-ratio "${SCANNER_ALERT_BREAKTHROUGH_RATIO}"
 )
 [[ -n ${SCANNER_UNDERLYING} ]] && ARGS+=(--underlying "${SCANNER_UNDERLYING}")
 [[ ${SCANNER_ONCE} == 1 ]] && ARGS+=(--once)
@@ -202,7 +209,7 @@ install_linux_service() {
   mkdir -p "$(dirname -- "${SYSTEMD_UNIT}")"
   cat >"${SYSTEMD_UNIT}" <<EOF
 [Unit]
-Description=Option surface scanner and Feishu alerts
+Description=Option surface scanner and DingTalk alerts
 After=network-online.target
 Wants=network-online.target
 

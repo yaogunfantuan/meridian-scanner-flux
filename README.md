@@ -6,7 +6,7 @@
 ## 代码结构
 
 ```text
-option_alert_daemon.py   常驻循环、目录缓存、日志和飞书提醒
+option_alert_daemon.py   常驻循环、目录缓存、日志和钉钉提醒
 exchange_adapters.py     Derive、Bybit、Gate REST 适配与字段标准化
 option_scanner_core.py   LOCAL 曲面、Put-Call Parity、P1 和 1-tick 算法
 scanner_http.py          gzip 响应解压与流量统计
@@ -113,13 +113,13 @@ SSL_CERT_FILE=/etc/ssl/cert.pem python3 -u option_alert_daemon.py \
 HTTP 客户端请求 gzip 压缩，并显示每轮压缩响应体大小及每日估算流量。估算不包含 TLS、
 HTTP 头和请求上传流量，因此是近似下限。
 
-## 飞书提醒
+## 钉钉提醒
 
-在飞书群添加自定义机器人并开启签名校验，然后设置环境变量：
+在钉钉群添加自定义机器人并开启加签，然后设置环境变量：
 
 ```bash
-export FEISHU_WEBHOOK_URL='https://open.feishu.cn/open-apis/bot/v2/hook/...'
-export FEISHU_WEBHOOK_SECRET='签名密钥'
+export DINGTALK_WEBHOOK_URL='https://oapi.dingtalk.com/robot/send?access_token=...'
+export DINGTALK_WEBHOOK_SECRET='SEC...'
 
 SSL_CERT_FILE=/etc/ssl/cert.pem python3 -u option_alert_daemon.py \
   --interval 60 \
@@ -137,7 +137,7 @@ SSL_CERT_FILE=/etc/ssl/cert.pem python3 -u option_alert_daemon.py \
 
 ```text
 ~/.local/share/option-scanner    程序
-~/.config/option-scanner         配置与飞书密钥（权限 0600）
+~/.config/option-scanner         配置与钉钉密钥（权限 0600）
 ~/.local/state/option-scanner    合约缓存、JSONL 和服务日志
 ```
 
