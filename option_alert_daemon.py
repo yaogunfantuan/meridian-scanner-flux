@@ -283,6 +283,13 @@ def actionable_one_ticks(
     )
 
 
+def one_tick_notifications(
+    rows: Sequence[Dict[str, Any]], enabled: bool
+) -> List[Dict[str, Any]]:
+    """Keep one-tick rows for terminal/log output while optionally muting alerts."""
+    return list(rows) if enabled else []
+
+
 def scan_nodes(
     venue: str,
     nodes: Sequence[core.Node],
@@ -593,6 +600,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--alert-cooldown-seconds", type=float, default=900.0)
     parser.add_argument("--alert-recovery-misses", type=int, default=5)
     parser.add_argument("--alert-breakthrough-ratio", type=float, default=0.30)
+    parser.add_argument(
+        "--notify-one-tick",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="是否把有效 1-tick 异常加入钉钉消息；默认启用",
+    )
     parser.add_argument("--once", action="store_true")
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--notify", action="store_true", help="向钉钉发送；默认只在终端输出")
@@ -753,16 +766,17 @@ def main() -> int:
                 append_log(args.log, record, args.max_log_mb)
 
             cooldown_snapshot: Dict[str, Dict[str, Any]] | None = None
+            eligible_tick_rows = one_tick_notifications(tick_rows, args.notify_one_tick)
             if args.notify:
                 cooldown_snapshot = copy.deepcopy(cooldown.items)
                 filter_time = time.time()
                 notify_vertical_rows = cooldown.filter_verticals(vertical_rows, filter_time)
                 notify_p1_rows = cooldown.filter_p1(p1_rows, filter_time)
-                notify_tick_rows = cooldown.filter_ticks(tick_rows, filter_time)
+                notify_tick_rows = cooldown.filter_ticks(eligible_tick_rows, filter_time)
             else:
                 notify_vertical_rows = vertical_rows
                 notify_p1_rows = p1_rows
-                notify_tick_rows = tick_rows
+                notify_tick_rows = eligible_tick_rows
 
             if notify_vertical_rows or notify_p1_rows or notify_tick_rows:
                 message = format_dingtalk_message(
@@ -779,7 +793,7 @@ def main() -> int:
                         print(f"钉钉发送失败（{exc}）", file=sys.stderr)
                 else:
                     print("钉钉：dry-run，未发送。")
-            elif vertical_rows or p1_rows or tick_rows:
+            elif vertical_rows or p1_rows or eligible_tick_rows:
                 print("钉钉：冷却节流后无新增/恢复/突破，未发送。")
             if args.notify:
                 cooldown.finish_round()

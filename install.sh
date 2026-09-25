@@ -169,6 +169,7 @@ fi
 : "${SCANNER_ALERT_BREAKTHROUGH_RATIO:=0.30}"
 : "${SCANNER_MAX_LOG_MB:=100}"
 : "${SCANNER_NOTIFY:=0}"
+: "${SCANNER_NOTIFY_ONE_TICK:=1}"
 
 mkdir -p "${STATE_DIR}"
 ARGS=(
@@ -190,6 +191,11 @@ ARGS=(
 )
 [[ -n ${SCANNER_UNDERLYING} ]] && ARGS+=(--underlying "${SCANNER_UNDERLYING}")
 [[ ${SCANNER_ONCE} == 1 ]] && ARGS+=(--once)
+if [[ ${SCANNER_NOTIFY_ONE_TICK} == 1 ]]; then
+  ARGS+=(--notify-one-tick)
+else
+  ARGS+=(--no-notify-one-tick)
+fi
 if [[ ${SCANNER_NOTIFY} == 1 ]]; then
   ARGS+=(--notify)
 else

@@ -5,6 +5,7 @@ import unittest
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import option_alert_daemon as daemon
 import option_scanner_core as core
@@ -264,6 +265,14 @@ class ScannerCoreTests(unittest.TestCase):
             daemon.dingtalk_sign("1599360473000", "test-secret"),
             "Mee7fHPnIHChjJIuEtxRUaKgA9a/2itMq8Jj5AtfVkc=",
         )
+
+    def test_one_tick_notifications_can_be_disabled(self) -> None:
+        with patch("sys.argv", ["option_alert_daemon.py", "--no-notify-one-tick"]):
+            args = daemon.parse_args()
+        self.assertFalse(args.notify_one_tick)
+        rows = [{"instrument": "TEST-C"}]
+        self.assertEqual(daemon.one_tick_notifications(rows, args.notify_one_tick), [])
+        self.assertEqual(daemon.one_tick_notifications(rows, True), rows)
 
     def test_jsonl_log_rotates(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
