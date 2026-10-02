@@ -326,6 +326,8 @@ class ScannerCoreTests(unittest.TestCase):
             "alert_basis": "MARK",
             "mark": 1.5,
             "mark_gap": 6.0,
+            "first_seen_at": 1735689600.0,
+            "notified_at": 1735689665.0,
             "notification_delay_seconds": 65.0,
         }
         message = daemon.format_dingtalk_message(
@@ -340,12 +342,19 @@ class ScannerCoreTests(unittest.TestCase):
             [{
                 "kind": "tick",
                 "row": tick,
+                "first_seen_at": 1735689600.0,
+                "missing_since_at": 1735693325.0,
+                "recovered_at": 1735693625.0,
                 "duration_seconds": 3725.0,
                 "recovery_delay_seconds": 300.0,
             }],
         )
         self.assertIn("发现→通知 1分5秒", message)
+        self.assertIn("首次发现 2025-01-01T08:00:00+08:00", message)
+        self.assertIn("通知 2025-01-01T08:01:05+08:00", message)
         self.assertIn("异常已消失：1", message)
+        self.assertIn("首次未发现 2025-01-01T09:02:05+08:00", message)
+        self.assertIn("结束确认 2025-01-01T09:07:05+08:00", message)
         self.assertIn("持续 1小时2分5秒", message)
         self.assertIn("消失确认 5分", message)
 

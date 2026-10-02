@@ -13,7 +13,7 @@ import os
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Sequence, Tuple
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
@@ -26,6 +26,7 @@ import scanner_http
 
 CACHE_VERSION = 1
 ALERT_STATE_VERSION = 2
+DISPLAY_TIMEZONE = timezone(timedelta(hours=8))
 
 
 class CatalogManager:
@@ -239,6 +240,8 @@ class AlertCooldown:
         if allowed:
             item["sent_at"] = now
             item["strength"] = strength
+            row["first_seen_at"] = float(item["first_seen_at"])
+            row["notified_at"] = now
             row["notification_delay_seconds"] = max(
                 now - float(item["first_seen_at"]), 0.0
             )
@@ -292,6 +295,9 @@ class AlertCooldown:
                         "key": key,
                         "kind": item.get("kind", key.split("|", 1)[0]),
                         "row": item.get("row", {}),
+                        "first_seen_at": first_seen_at,
+                        "missing_since_at": missing_since_at,
+                        "recovered_at": now,
                         "duration_seconds": max(missing_since_at - first_seen_at, 0.0),
                         "recovery_delay_seconds": max(now - missing_since_at, 0.0),
                     })
@@ -481,6 +487,23 @@ def format_duration(seconds: float) -> str:
     return "".join(parts)
 
 
+def format_timestamp(timestamp: float) -> str:
+    return datetime.fromtimestamp(timestamp, DISPLAY_TIMEZONE).isoformat(
+        timespec="seconds"
+    )
+
+
+def format_notification_times(row: Dict[str, Any]) -> str:
+    first_seen_at = row.get("first_seen_at")
+    notified_at = row.get("notified_at")
+    if first_seen_at is None or notified_at is None:
+        return ""
+    return (
+        f"；首次发现 {format_timestamp(float(first_seen_at))}"
+        f"；通知 {format_timestamp(float(notified_at))}"
+    )
+
+
 def format_recovery_row(recovery: Dict[str, Any]) -> str:
     row = recovery.get("row") or {}
     kind = recovery.get("kind")
@@ -501,7 +524,10 @@ def format_recovery_row(recovery: Dict[str, Any]) -> str:
             f"{row.get('side', '')}；{row.get('alert_basis', '')}"
         )
     return (
-        f"{identity}；持续 {format_duration(float(recovery['duration_seconds']))}；"
+        f"{identity}；首次发现 {format_timestamp(float(recovery['first_seen_at']))}；"
+        f"首次未发现 {format_timestamp(float(recovery['missing_since_at']))}；"
+        f"结束确认 {format_timestamp(float(recovery['recovered_at']))}；"
+        f"持续 {format_duration(float(recovery['duration_seconds']))}；"
         f"消失确认 {format_duration(float(recovery['recovery_delay_seconds']))}"
     )
 
@@ -533,6 +559,7 @@ def format_dingtalk_message(
                 f"卖 {row['short_instrument']} @ {row['short_price']:g}；"
                 f"× {row['size']:g}；扣开仓费净 {row['net_usdt']:.2f} USDT；"
                 f"发现→通知 {format_duration(row.get('notification_delay_seconds', 0.0))}"
+                f"{format_notification_times(row)}"
             )
     if p1_rows:
         remaining = max(limit - used, 0)
@@ -561,6 +588,7 @@ def format_dingtalk_message(
                 f"{row['venue']} {row['instrument']} {row['signal']} @ {row['price']:g} "
                 f"× {row['size']:g}；{row['mode']}；{detail}{quality}{one_tick}；"
                 f"发现→通知 {format_duration(row.get('notification_delay_seconds', 0.0))}"
+                f"{format_notification_times(row)}"
             )
     if tick_rows:
         remaining = max(limit - used, 0)
@@ -572,6 +600,7 @@ def format_dingtalk_message(
                 f"{row['venue']} {row['instrument']} {row['side']} @ {price:g} × {size:g}；"
                 f"{row['alert_basis']}；mark {row['mark']:g}；mark差 {row['mark_gap']:.1f}t；"
                 f"发现→通知 {format_duration(row.get('notification_delay_seconds', 0.0))}"
+                f"{format_notification_times(row)}"
             )
     if recovered_rows:
         lines.append(f"\n异常已消失：{len(recovered_rows)}")
@@ -834,7 +863,7 @@ def main() -> int:
             elapsed = time.time() - round_started
             catalog_bytes = after_catalog - before_catalog
             ticker_bytes = after_tickers - after_catalog
-            stamp = datetime.now().astimezone().isoformat(timespec="seconds")
+            stamp = datetime.now(DISPLAY_TIMEZONE).isoformat(timespec="seconds")
             estimated_gib_day = ticker_bytes * 1440 / 1024 / 1024 / 1024
 
             print(
