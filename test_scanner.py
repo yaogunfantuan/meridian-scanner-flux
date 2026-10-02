@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import tempfile
 import unittest
 from dataclasses import replace
@@ -294,18 +295,75 @@ class ScannerCoreTests(unittest.TestCase):
             }
 
             self.assertEqual(cooldown.filter_ticks([row], 1000.0), [row])
-            cooldown.finish_round()
+            self.assertEqual(row["notification_delay_seconds"], 0.0)
+            self.assertEqual(cooldown.finish_round(1000.0), [])
 
             self.assertEqual(cooldown.filter_ticks([row], 1060.0), [])
-            cooldown.finish_round()
+            self.assertEqual(cooldown.finish_round(1060.0), [])
 
-            cooldown.finish_round()
-            cooldown.finish_round()
-            self.assertEqual(cooldown.filter_ticks([row], 1120.0), [row])
-            cooldown.finish_round()
+            self.assertEqual(cooldown.finish_round(1120.0), [])
+            recovered = cooldown.finish_round(1180.0)
+            self.assertEqual(len(recovered), 1)
+            self.assertEqual(recovered[0]["duration_seconds"], 120.0)
+            self.assertEqual(recovered[0]["recovery_delay_seconds"], 60.0)
+            self.assertEqual(cooldown.finish_round(1240.0), [])
+            self.assertEqual(cooldown.filter_ticks([row], 1240.0), [row])
+            self.assertEqual(row["notification_delay_seconds"], 0.0)
+            cooldown.finish_round(1240.0)
 
             stronger = dict(row, mark_gap=8.0)
-            self.assertEqual(cooldown.filter_ticks([stronger], 1180.0), [stronger])
+            self.assertEqual(cooldown.filter_ticks([stronger], 1300.0), [stronger])
+
+    def test_alert_message_includes_detection_and_episode_durations(self) -> None:
+        tick = {
+            "venue": "Derive",
+            "instrument": "ETH-C",
+            "side": "BUY",
+            "ask": 1.2,
+            "ask_size": 3.0,
+            "bid": 1.1,
+            "bid_size": 2.0,
+            "alert_basis": "MARK",
+            "mark": 1.5,
+            "mark_gap": 6.0,
+            "notification_delay_seconds": 65.0,
+        }
+        message = daemon.format_dingtalk_message(
+            "2030-01-01T00:00:00+00:00",
+            [],
+            [],
+            [tick],
+            [],
+            1.0,
+            0,
+            5,
+            [{
+                "kind": "tick",
+                "row": tick,
+                "duration_seconds": 3725.0,
+                "recovery_delay_seconds": 300.0,
+            }],
+        )
+        self.assertIn("发现→通知 1分5秒", message)
+        self.assertIn("异常已消失：1", message)
+        self.assertIn("持续 1小时2分5秒", message)
+        self.assertIn("消失确认 5分", message)
+
+    def test_v1_recovered_state_does_not_emit_historical_recovery_burst(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "cooldown.json"
+            path.write_text(json.dumps({
+                "version": 1,
+                "items": {
+                    "tick|Derive|OLD-C|BUY|MARK": {
+                        "sent_at": 1000.0,
+                        "strength": 6.0,
+                        "misses": 1,
+                    }
+                },
+            }))
+            cooldown = daemon.AlertCooldown(path, 900, 5, 0.30)
+            self.assertEqual(cooldown.finish_round(2000.0), [])
 
 
 if __name__ == "__main__":

@@ -25,7 +25,7 @@ import scanner_http
 
 
 CACHE_VERSION = 1
-ALERT_STATE_VERSION = 1
+ALERT_STATE_VERSION = 2
 
 
 class CatalogManager:
@@ -133,8 +133,17 @@ class AlertCooldown:
     def _read(self) -> Dict[str, Dict[str, Any]]:
         try:
             value = json.loads(self.path.read_text(encoding="utf-8"))
-            if value.get("version") == ALERT_STATE_VERSION and isinstance(value.get("items"), dict):
-                return value["items"]
+            version = value.get("version")
+            if version in (1, ALERT_STATE_VERSION) and isinstance(value.get("items"), dict):
+                items = value["items"]
+                for item in items.values():
+                    # V1 retained every key forever but did not persist enough
+                    # lifecycle detail to distinguish active from historical
+                    # alerts. Treat all such entries as closed. A currently
+                    # visible signal starts a clean V2 episode in _observe().
+                    if version == 1 or "kind" not in item or "row" not in item:
+                        item["active"] = False
+                return items
         except FileNotFoundError:
             pass
         except (OSError, ValueError, TypeError) as exc:
@@ -186,6 +195,8 @@ class AlertCooldown:
         item = self.items.get(key)
         if not item:
             return True
+        if not item.get("active", True):
+            return True
         sent_at = float(item.get("sent_at", 0.0))
         if now - sent_at >= self.cooldown_seconds:
             return True
@@ -196,17 +207,51 @@ class AlertCooldown:
             return strength > 0
         return strength >= previous_strength * (1.0 + self.breakthrough_ratio)
 
+    def _observe(
+        self,
+        key: str,
+        kind: str,
+        row: Dict[str, Any],
+        strength: float,
+        now: float,
+    ) -> bool:
+        item = self.items.get(key)
+        observed_at = float(row.get("detected_at", now))
+        if not item or not item.get("active", True):
+            item = {
+                "active": True,
+                "first_seen_at": observed_at,
+                "last_seen_at": observed_at,
+                "misses": 0,
+                "kind": kind,
+            }
+            self.items[key] = item
+        else:
+            # V1 did not persist episode boundaries. sent_at is the closest
+            # restart-safe approximation for an alert that is already active.
+            item.setdefault("first_seen_at", float(item.get("sent_at", now)))
+            item["last_seen_at"] = observed_at
+            item["misses"] = 0
+            item["kind"] = kind
+            item.pop("missing_since_at", None)
+        item["row"] = row
+        allowed = self._allows(key, strength, now)
+        if allowed:
+            item["sent_at"] = now
+            item["strength"] = strength
+            row["notification_delay_seconds"] = max(
+                now - float(item["first_seen_at"]), 0.0
+            )
+        return allowed
+
     def filter_p1(self, rows: Sequence[Dict[str, Any]], now: float) -> List[Dict[str, Any]]:
         allowed: List[Dict[str, Any]] = []
         for row in rows:
             key = self.p1_key(row)
             strength = self.p1_strength(row)
-            self.seen_keys.add(key)
-            if self._allows(key, strength, now):
+            if self._observe(key, "p1", row, strength, now):
                 allowed.append(row)
-                self.items[key] = {"sent_at": now, "strength": strength, "misses": 0}
-            elif key in self.items:
-                self.items[key]["misses"] = 0
+            self.seen_keys.add(key)
         return allowed
 
     def filter_ticks(self, rows: Sequence[Dict[str, Any]], now: float) -> List[Dict[str, Any]]:
@@ -214,12 +259,9 @@ class AlertCooldown:
         for row in rows:
             key = self.tick_key(row)
             strength = self.tick_strength(row)
-            self.seen_keys.add(key)
-            if self._allows(key, strength, now):
+            if self._observe(key, "tick", row, strength, now):
                 allowed.append(row)
-                self.items[key] = {"sent_at": now, "strength": strength, "misses": 0}
-            elif key in self.items:
-                self.items[key]["misses"] = 0
+            self.seen_keys.add(key)
         return allowed
 
     def filter_verticals(
@@ -229,19 +271,36 @@ class AlertCooldown:
         for row in rows:
             key = self.vertical_key(row)
             strength = self.vertical_strength(row)
-            self.seen_keys.add(key)
-            if self._allows(key, strength, now):
+            if self._observe(key, "vertical", row, strength, now):
                 allowed.append(row)
-                self.items[key] = {"sent_at": now, "strength": strength, "misses": 0}
-            elif key in self.items:
-                self.items[key]["misses"] = 0
+            self.seen_keys.add(key)
         return allowed
 
-    def finish_round(self) -> None:
+    def finish_round(self, now: float | None = None) -> List[Dict[str, Any]]:
+        now = time.time() if now is None else now
+        recovered: List[Dict[str, Any]] = []
         for key, item in self.items.items():
-            if key not in self.seen_keys:
+            if key not in self.seen_keys and item.get("active", True):
                 item["misses"] = int(item.get("misses", 0)) + 1
+                item.setdefault("missing_since_at", now)
+                if self.recovery_misses > 0 and item["misses"] >= self.recovery_misses:
+                    first_seen_at = float(
+                        item.get("first_seen_at", item.get("sent_at", now))
+                    )
+                    missing_since_at = float(item.get("missing_since_at", now))
+                    recovered.append({
+                        "key": key,
+                        "kind": item.get("kind", key.split("|", 1)[0]),
+                        "row": item.get("row", {}),
+                        "duration_seconds": max(missing_since_at - first_seen_at, 0.0),
+                        "recovery_delay_seconds": max(now - missing_since_at, 0.0),
+                    })
+                    item["active"] = False
+                    item["recovered_at"] = now
         self.seen_keys.clear()
+        return recovered
+
+    def write(self) -> None:
         self._write()
 
 
@@ -312,6 +371,7 @@ def scan_nodes(
     p1_rows = [row for row in candidates if core.is_p1_local(row, args)]
     for row in p1_rows:
         row["mode"] = "PCP_NET" if core.is_pcp_net(row, args) else "LOCAL_NET"
+        row["detected_at"] = now
     p1_rows.sort(
         key=lambda row: (
             row["mode"] == "PCP_NET",
@@ -340,6 +400,8 @@ def scan_nodes(
         row["one_tick"] = (row["venue"], row["instrument"], row["signal"]) in one_tick_keys
     p1_keys = {(row["venue"], row["instrument"], row["signal"]) for row in p1_rows}
     tick_alerts = actionable_one_ticks(one_ticks, p1_keys, args.mark_fallback_ticks)
+    for row in tick_alerts:
+        row["detected_at"] = now
     vertical_rows = core.find_vertical_arbitrages(
         nodes,
         min_size=args.min_size,
@@ -347,6 +409,7 @@ def scan_nodes(
     )
     for row in vertical_rows:
         row["venue"] = label
+        row["detected_at"] = now
     summary = {
         "venue": label,
         "active": active,
@@ -401,6 +464,48 @@ def print_tick_alerts(rows: Sequence[Dict[str, Any]], limit: int) -> None:
     )
 
 
+def format_duration(seconds: float) -> str:
+    seconds = max(int(round(seconds)), 0)
+    days, seconds = divmod(seconds, 86400)
+    hours, seconds = divmod(seconds, 3600)
+    minutes, seconds = divmod(seconds, 60)
+    parts: List[str] = []
+    if days:
+        parts.append(f"{days}天")
+    if hours:
+        parts.append(f"{hours}小时")
+    if minutes:
+        parts.append(f"{minutes}分")
+    if seconds or not parts:
+        parts.append(f"{seconds}秒")
+    return "".join(parts)
+
+
+def format_recovery_row(recovery: Dict[str, Any]) -> str:
+    row = recovery.get("row") or {}
+    kind = recovery.get("kind")
+    if kind == "vertical":
+        identity = (
+            f"{row.get('venue', '-')} {row.get('option_type', '')} "
+            f"{row.get('violation', '')}；{row.get('long_instrument', '-')} / "
+            f"{row.get('short_instrument', '-')}"
+        )
+    elif kind == "p1":
+        identity = (
+            f"{row.get('venue', '-')} {row.get('instrument', '-')} "
+            f"{row.get('signal', '')}；{row.get('mode', '')}"
+        )
+    else:
+        identity = (
+            f"{row.get('venue', '-')} {row.get('instrument', '-')} "
+            f"{row.get('side', '')}；{row.get('alert_basis', '')}"
+        )
+    return (
+        f"{identity}；持续 {format_duration(float(recovery['duration_seconds']))}；"
+        f"消失确认 {format_duration(float(recovery['recovery_delay_seconds']))}"
+    )
+
+
 def format_dingtalk_message(
     stamp: str,
     p1_rows: Sequence[Dict[str, Any]],
@@ -410,6 +515,7 @@ def format_dingtalk_message(
     elapsed: float,
     ticker_bytes: int,
     limit: int,
+    recovered_rows: Sequence[Dict[str, Any]] = (),
 ) -> str:
     lines = [
         f"【Scanner 期权曲面扫描】{stamp}",
@@ -425,7 +531,8 @@ def format_dingtalk_message(
                 f"{row['venue']} {row['option_type']} {row['violation']}；"
                 f"买 {row['long_instrument']} @ {row['long_price']:g}；"
                 f"卖 {row['short_instrument']} @ {row['short_price']:g}；"
-                f"× {row['size']:g}；扣开仓费净 {row['net_usdt']:.2f} USDT"
+                f"× {row['size']:g}；扣开仓费净 {row['net_usdt']:.2f} USDT；"
+                f"发现→通知 {format_duration(row.get('notification_delay_seconds', 0.0))}"
             )
     if p1_rows:
         remaining = max(limit - used, 0)
@@ -452,7 +559,8 @@ def format_dingtalk_message(
             )
             lines.append(
                 f"{row['venue']} {row['instrument']} {row['signal']} @ {row['price']:g} "
-                f"× {row['size']:g}；{row['mode']}；{detail}{quality}{one_tick}"
+                f"× {row['size']:g}；{row['mode']}；{detail}{quality}{one_tick}；"
+                f"发现→通知 {format_duration(row.get('notification_delay_seconds', 0.0))}"
             )
     if tick_rows:
         remaining = max(limit - used, 0)
@@ -462,8 +570,13 @@ def format_dingtalk_message(
             size = row["ask_size"] if row["side"] == "BUY" else row["bid_size"]
             lines.append(
                 f"{row['venue']} {row['instrument']} {row['side']} @ {price:g} × {size:g}；"
-                f"{row['alert_basis']}；mark {row['mark']:g}；mark差 {row['mark_gap']:.1f}t"
+                f"{row['alert_basis']}；mark {row['mark']:g}；mark差 {row['mark_gap']:.1f}t；"
+                f"发现→通知 {format_duration(row.get('notification_delay_seconds', 0.0))}"
             )
+    if recovered_rows:
+        lines.append(f"\n异常已消失：{len(recovered_rows)}")
+        for recovery in recovered_rows[:limit]:
+            lines.append(format_recovery_row(recovery))
     lines.append(
         "\n覆盖 "
         + "；".join(
@@ -773,15 +886,17 @@ def main() -> int:
                 notify_vertical_rows = cooldown.filter_verticals(vertical_rows, filter_time)
                 notify_p1_rows = cooldown.filter_p1(p1_rows, filter_time)
                 notify_tick_rows = cooldown.filter_ticks(eligible_tick_rows, filter_time)
+                recovered_rows = cooldown.finish_round(filter_time)
             else:
                 notify_vertical_rows = vertical_rows
                 notify_p1_rows = p1_rows
                 notify_tick_rows = eligible_tick_rows
+                recovered_rows = []
 
-            if notify_vertical_rows or notify_p1_rows or notify_tick_rows:
+            if notify_vertical_rows or notify_p1_rows or notify_tick_rows or recovered_rows:
                 message = format_dingtalk_message(
                     stamp, notify_p1_rows, notify_vertical_rows, notify_tick_rows,
-                    summaries, elapsed, ticker_bytes, args.alert_limit
+                    summaries, elapsed, ticker_bytes, args.alert_limit, recovered_rows
                 )
                 if args.notify:
                     try:
@@ -796,7 +911,7 @@ def main() -> int:
             elif vertical_rows or p1_rows or eligible_tick_rows:
                 print("钉钉：冷却节流后无新增/恢复/突破，未发送。")
             if args.notify:
-                cooldown.finish_round()
+                cooldown.write()
 
             if args.once:
                 return 0 if summaries else 1
