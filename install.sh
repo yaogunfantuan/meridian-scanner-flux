@@ -170,6 +170,10 @@ fi
 : "${SCANNER_MAX_LOG_MB:=100}"
 : "${SCANNER_NOTIFY:=0}"
 : "${SCANNER_NOTIFY_ONE_TICK:=1}"
+: "${SCANNER_DERIVE_SPOT:=0}"
+: "${SCANNER_SPOT_MIN_EDGE_BPS:=50}"
+: "${SCANNER_SPOT_MIN_NOTIONAL:=10}"
+: "${SCANNER_SPOT_SUMMARY_INTERVAL:=3600}"
 
 mkdir -p "${STATE_DIR}"
 ARGS=(
@@ -188,9 +192,13 @@ ARGS=(
   --alert-cooldown-seconds "${SCANNER_ALERT_COOLDOWN_SECONDS}"
   --alert-recovery-misses "${SCANNER_ALERT_RECOVERY_MISSES}"
   --alert-breakthrough-ratio "${SCANNER_ALERT_BREAKTHROUGH_RATIO}"
+  --spot-min-edge-bps "${SCANNER_SPOT_MIN_EDGE_BPS}"
+  --spot-min-notional "${SCANNER_SPOT_MIN_NOTIONAL}"
+  --spot-summary-interval "${SCANNER_SPOT_SUMMARY_INTERVAL}"
 )
 [[ -n ${SCANNER_UNDERLYING} ]] && ARGS+=(--underlying "${SCANNER_UNDERLYING}")
 [[ ${SCANNER_ONCE} == 1 ]] && ARGS+=(--once)
+[[ ${SCANNER_DERIVE_SPOT} == 1 ]] && ARGS+=(--derive-spot)
 if [[ ${SCANNER_NOTIFY_ONE_TICK} == 1 ]]; then
   ARGS+=(--notify-one-tick)
 else

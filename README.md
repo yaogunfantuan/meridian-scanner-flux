@@ -1,18 +1,19 @@
 # 多交易所期权曲面扫描器
 
-使用 Derive、Bybit 和 Gate.io 的公开 REST API 扫描可成交期权报价。交易所行情只在各自
-内部构建曲面，不会跨交易所混合。
+使用 Derive、Bybit 和 Gate.io 的 REST API 扫描可成交期权报价，并可选监控 Derive
+全部现货盘口相对指数价的偏离。期权行情只在各交易所内部构建曲面，不会跨交易所混合。
 
 ## 代码结构
 
 ```text
-option_alert_daemon.py   常驻循环、目录缓存、日志和钉钉提醒
-exchange_adapters.py     Derive、Bybit、Gate REST 适配与字段标准化
+option_alert_daemon.py   常驻循环、目录缓存、Spot/Options 日志和钉钉提醒
+exchange_adapters.py     Derive Spot 与三家 Options REST 适配、公开费率和字段标准化
 option_scanner_core.py   LOCAL 曲面、Put-Call Parity、P1 和 1-tick 算法
 scanner_http.py          gzip 响应解压与流量统计
 ```
 
-运行只需要 Python 3.9+，不依赖第三方包，也不需要交易所 API Key。
+运行只需要 Python 3.9+，不依赖第三方包。期权和 Derive Spot 都只读取公共接口，
+不需要交易所凭据或登录。
 
 ## 信号分类
 
@@ -38,7 +39,11 @@ scanner_http.py          gzip 响应解压与流量统计
   `1tick=True`。
 - mark 只作为辅助诊断，不单独充当 P1 公允价值。
 
-期权手续费优先使用交易所公开合约字段；Bybit 使用公开的非 VIP 期权费率与费率上限。
+期权手续费使用交易所公开合约字段；Bybit 使用公开的非 VIP 期权费率与费率上限。
+Derive 从全部活跃期权合约中分别取最高公开 `taker_fee_rate`、最高 `base_fee` 和最高
+手续费上限，按保守的最贵组合计算。LOCAL 按进出各一次扣费，PCP 按两条期权腿的
+开平仓及 Delta 对冲往返扣费，VERTICAL_NET 按两条腿的开仓费扣费。
+
 `PCP_NET` 的 Delta 对冲默认按往返 Taker 0.05% 估算，可按账户实际费率修改：
 
 ```bash
@@ -138,6 +143,27 @@ SCANNER_NOTIFY_ONE_TICK=0
 ```
 
 Webhook 和签名密钥只从环境变量读取，不会写入缓存或日志。
+
+## Derive Spot 监控
+
+Spot 只监控 Derive，不读取 Bybit 或 Gate.io 现货。每轮获取全部活跃 `erc20` 合约及
+最佳 bid/ask，以 ticker 的指数价 `I` 为基准：ask 显著低于指数价产生 BUY，bid 显著
+高于指数价产生 SELL。信号按当前最佳档全部数量计算，从全部活跃 Spot 合约中分别取
+最高公开 `taker_fee_rate` 和最高 `base_fee`，扣除一次进场和一次退出的最贵费用；只有
+手续费后净偏离和最佳档名义金额都达到门槛才提醒。
+
+默认关闭。配置示例：
+
+```bash
+SCANNER_DERIVE_SPOT=1
+SCANNER_SPOT_MIN_EDGE_BPS=50
+SCANNER_SPOT_MIN_NOTIONAL=10
+SCANNER_SPOT_SUMMARY_INTERVAL=3600
+```
+
+Spot 与 Options 使用同一个 `SCANNER_INTERVAL`，当前安装默认每 60 秒运行一次。启用钉钉时，
+`SCANNER_SPOT_SUMMARY_INTERVAL` 还会按指定间隔发送全部活跃 Spot 的最佳 bid/ask 价格与
+数量以及 index；发送时间写入状态文件，服务重启不会重复发送。设置为 `0` 可关闭总结。
 
 ## 部署到其他机器
 

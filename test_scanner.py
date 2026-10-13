@@ -8,6 +8,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import exchange_adapters as adapters
 import option_alert_daemon as daemon
 import option_scanner_core as core
 
@@ -110,6 +111,146 @@ class ScannerCoreTests(unittest.TestCase):
         self.assertAlmostEqual(metrics["raw_ticks"], 2.0)  # type: ignore[index]
         self.assertAlmostEqual(metrics["net_ticks"], -3.0)  # type: ignore[index]
         self.assertTrue(metrics["fees_complete"])  # type: ignore[index]
+
+    def test_option_fee_includes_public_base_fee_per_order(self) -> None:
+        candidate = replace(
+            node("TEST-C", 100, "C", 4.9, 5.0),
+            index_price=100.0,
+            taker_fee_rate=0.001,
+            trade_fee_cap_rate=1.0,
+            base_fee=0.5,
+        )
+        self.assertAlmostEqual(
+            core.option_trade_fee_total(candidate, 5.0, quantity=2.0),
+            0.7,
+        )
+
+    def test_derive_max_public_fees_uses_most_expensive_fields(self) -> None:
+        self.assertEqual(
+            adapters.derive_max_public_fees(
+                [
+                    {
+                        "taker_fee_rate": "0.001",
+                        "maker_fee_rate": "0.0005",
+                        "base_fee": "0.01",
+                        "mark_price_fee_rate_cap": "0.10",
+                    },
+                    {
+                        "taker_fee_rate": "0.002",
+                        "maker_fee_rate": "0.001",
+                        "base_fee": "0.02",
+                        "mark_price_fee_rate_cap": "0.125",
+                    },
+                ]
+            ),
+            {
+                "taker_fee_rate": 0.002,
+                "maker_fee_rate": 0.001,
+                "base_fee": 0.02,
+                "trade_fee_cap_rate": 0.125,
+            },
+        )
+
+    def test_derive_spot_alerts_use_max_public_roundtrip_fee(self) -> None:
+        catalog = {
+            "TEST-USDC": {
+                "instrument_name": "TEST-USDC",
+                "taker_fee_rate": "0.001",
+                "base_fee": "0.01",
+            },
+            "EXPENSIVE-USDC": {
+                "instrument_name": "EXPENSIVE-USDC",
+                "taker_fee_rate": "0.002",
+                "base_fee": "0.02",
+            },
+        }
+        tickers = {
+            "TEST-USDC": {
+                "I": "100",
+                "b": "102",
+                "B": "2",
+                "a": "98",
+                "A": "2",
+            }
+        }
+        summary, rows = adapters.derive_spot_alerts(
+            catalog,
+            tickers,
+            min_edge_bps=100.0,
+            min_notional=10.0,
+            now=1000.0,
+        )
+        self.assertEqual(summary["candidates"], 2)
+        self.assertEqual(len(summary["bbo"]), 1)
+        self.assertEqual(summary["bbo"][0]["instrument"], "TEST-USDC")
+        self.assertEqual(summary["bbo"][0]["bid"], 102.0)
+        self.assertEqual(summary["bbo"][0]["ask"], 98.0)
+        self.assertEqual(summary["bbo"][0]["index_price"], 100.0)
+        self.assertEqual({row["side"] for row in rows}, {"BUY", "SELL"})
+        buy = next(row for row in rows if row["side"] == "BUY")
+        self.assertEqual(buy["fee_source"], "public_max")
+        self.assertAlmostEqual(buy["gross_bps"], 200.0)
+        self.assertAlmostEqual(buy["fee_usd"], 0.832)
+        self.assertAlmostEqual(buy["net_bps"], 158.4)
+        self.assertEqual(buy["detected_at"], 1000.0)
+
+    def test_derive_option_nodes_use_public_max_fee_schedule(self) -> None:
+        name = "BTC-20300101-100-C"
+        options = {
+            name: {
+                "instrument_name": name,
+                "tick_size": "0.1",
+                "taker_fee_rate": "0.0003",
+                "mark_price_fee_rate_cap": "0.125",
+                "base_fee": "0.5",
+                "option_details": {
+                    "expiry": 1893456000,
+                    "strike": "100",
+                    "option_type": "C",
+                },
+            }
+        }
+        ticker = {
+            "b": "4.9",
+            "B": "2",
+            "a": "5",
+            "A": "2",
+            "M": "4.95",
+            "I": "100",
+            "option_pricing": {
+                "bi": "0.49",
+                "ai": "0.51",
+                "i": "0.5",
+                "f": "100",
+                "df": "1",
+            },
+        }
+        with patch.object(
+            adapters,
+            "derive_rpc",
+            return_value={"tickers": {name: ticker}},
+        ):
+            fee_schedule = adapters.derive_max_public_fees(
+                [
+                    options[name],
+                    {
+                        "taker_fee_rate": "0.0006",
+                        "mark_price_fee_rate_cap": "0.20",
+                        "base_fee": "0.75",
+                    },
+                ]
+            )
+            nodes = adapters.derive_parse_tickers(
+                "BTC",
+                options,
+                adapters.RequestPacer(10),
+                workers=1,
+                fee_schedule=fee_schedule,
+            )
+        self.assertEqual(len(nodes), 1)
+        self.assertEqual(nodes[0].taker_fee_rate, 0.0006)
+        self.assertEqual(nodes[0].trade_fee_cap_rate, 0.20)
+        self.assertEqual(nodes[0].base_fee, 0.75)
 
     def test_vertical_call_monotonicity_uses_executable_prices_and_fees(self) -> None:
         low = replace(
@@ -357,6 +498,81 @@ class ScannerCoreTests(unittest.TestCase):
         self.assertIn("结束确认 2025-01-01T09:07:05+08:00", message)
         self.assertIn("持续 1小时2分5秒", message)
         self.assertIn("消失确认 5分", message)
+
+    def test_alert_message_includes_spot_net_deviation(self) -> None:
+        spot = {
+            "venue": "Derive Spot",
+            "instrument": "DRV-USDC",
+            "side": "SELL",
+            "price": 0.42,
+            "amount": 100.0,
+            "index_price": 0.41,
+            "gross_bps": 243.9,
+            "fee_bps": 30.0,
+            "net_bps": 213.9,
+            "net_usd": 0.877,
+            "fee_source": "public_max",
+        }
+        message = daemon.format_dingtalk_message(
+            "2030-01-01T00:00:00+00:00",
+            [],
+            [],
+            [],
+            [],
+            1.0,
+            0,
+            5,
+            spot_rows=[spot],
+        )
+        self.assertIn("Derive 现货净偏离：1", message)
+        self.assertIn("DRV-USDC SELL", message)
+        self.assertIn("净偏离 213.9bp", message)
+        self.assertIn("费率来源 public_max", message)
+
+    def test_spot_hourly_summary_includes_bbo_and_index(self) -> None:
+        message = daemon.format_spot_summary_message(
+            "2030-01-01T00:00:00+08:00",
+            {
+                "active": 2,
+                "returned": 2,
+                "quoted": 1,
+                "two_sided": 1,
+                "bbo": [
+                    {
+                        "instrument": "DRV-USDC",
+                        "bid": 0.41,
+                        "bid_size": 100.0,
+                        "ask": 0.42,
+                        "ask_size": 200.0,
+                        "index_price": 0.415,
+                    },
+                    {
+                        "instrument": "TEST-USDC",
+                        "bid": None,
+                        "bid_size": None,
+                        "ask": None,
+                        "ask_size": None,
+                        "index_price": 1.0,
+                    },
+                ],
+            },
+        )
+        self.assertIn("Derive Spot 每小时 BBO", message)
+        self.assertIn("DRV-USDC｜bid 0.41 × 100｜ask 0.42 × 200｜index 0.415", message)
+        self.assertIn("TEST-USDC｜bid -｜ask -｜index 1", message)
+
+    def test_spot_hourly_summary_schedule_survives_restart(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "cooldown.json"
+            cooldown = daemon.AlertCooldown(path, 900, 5, 0.30)
+            self.assertTrue(cooldown.spot_summary_due(1000.0, 3600.0))
+            cooldown.mark_spot_summary_sent(1000.0)
+            cooldown.write()
+
+            restarted = daemon.AlertCooldown(path, 900, 5, 0.30)
+            self.assertFalse(restarted.spot_summary_due(4599.0, 3600.0))
+            self.assertTrue(restarted.spot_summary_due(4600.0, 3600.0))
+            self.assertFalse(restarted.spot_summary_due(9999.0, 0.0))
 
     def test_v1_recovered_state_does_not_emit_historical_recovery_burst(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

@@ -1,4 +1,4 @@
-"""Public REST adapters that normalize Derive, Bybit, and Gate options."""
+"""REST adapters for Derive spot plus Derive, Bybit, and Gate options."""
 
 from __future__ import annotations
 
@@ -10,7 +10,7 @@ from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from http.client import HTTPException
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, Iterable, List, Mapping, Tuple
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
@@ -96,6 +96,24 @@ def derive_rpc(
     raise AssertionError("unreachable")
 
 
+def derive_max_public_fees(
+    instruments: Iterable[Mapping[str, Any]],
+) -> Dict[str, float | None]:
+    """Return the most expensive public Derive orderbook fee fields."""
+    rows = list(instruments)
+
+    def maximum(field: str) -> float | None:
+        values = [value for row in rows if (value := fnum(row.get(field))) is not None]
+        return max(values) if values else None
+
+    return {
+        "taker_fee_rate": maximum("taker_fee_rate"),
+        "maker_fee_rate": maximum("maker_fee_rate"),
+        "base_fee": maximum("base_fee"),
+        "trade_fee_cap_rate": maximum("mark_price_fee_rate_cap"),
+    }
+
+
 def fetch_derive_catalog(
     pacer: RequestPacer,
     workers: int,
@@ -145,6 +163,7 @@ def derive_parse_tickers(
     options: Dict[str, Dict[str, Any]],
     pacer: RequestPacer,
     workers: int,
+    fee_schedule: Mapping[str, float | None] | None = None,
 ) -> List[core.Node]:
     groups: Dict[str, List[str]] = defaultdict(list)
     for name, instrument in options.items():
@@ -202,11 +221,177 @@ def derive_parse_tickers(
                     discount=fnum(ticker_value(pricing, "discount_factor", "df")) or 1.0,
                     index_price=fnum(ticker_value(ticker, "index_price", "I")),
                     contract_multiplier=1.0,
-                    taker_fee_rate=fnum(meta.get("taker_fee_rate")),
-                    trade_fee_cap_rate=fnum(meta.get("mark_price_fee_rate_cap")),
+                    taker_fee_rate=(
+                        fnum(fee_schedule.get("taker_fee_rate"))
+                        if fee_schedule
+                        else fnum(meta.get("taker_fee_rate"))
+                    ),
+                    trade_fee_cap_rate=(
+                        fnum(fee_schedule.get("trade_fee_cap_rate"))
+                        if fee_schedule
+                        else fnum(meta.get("mark_price_fee_rate_cap"))
+                    ),
+                    base_fee=(
+                        fnum(fee_schedule.get("base_fee"))
+                        if fee_schedule
+                        else fnum(meta.get("base_fee"))
+                    ) or 0.0,
                 )
             )
     return nodes
+
+
+def fetch_derive_spot_catalog(
+    pacer: RequestPacer,
+) -> Dict[str, Dict[str, Any]]:
+    results: List[Dict[str, Any]] = []
+    page = 1
+    while True:
+        result = derive_rpc(
+            pacer,
+            "public/get_all_instruments",
+            {
+                "instrument_type": "erc20",
+                "expired": False,
+                "page": page,
+                "page_size": 1000,
+            },
+        )
+        results.append(result)
+        pages = int(result["pagination"]["num_pages"])
+        if page >= pages:
+            break
+        page += 1
+    return {
+        str(instrument["instrument_name"]): instrument
+        for result in results
+        for instrument in result["instruments"]
+        if instrument.get("is_active")
+    }
+
+
+def derive_spot_alerts(
+    catalog: Mapping[str, Dict[str, Any]],
+    tickers: Mapping[str, Dict[str, Any]],
+    min_edge_bps: float,
+    min_notional: float,
+    now: float | None = None,
+) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
+    """Find executable Derive spot quotes far from their index after round-trip fees."""
+    detected_at = time.time() if now is None else now
+    fee_schedule = derive_max_public_fees(catalog.values())
+    fee_rate = fnum(fee_schedule.get("taker_fee_rate"))
+    base_fee = fnum(fee_schedule.get("base_fee")) or 0.0
+    rows: List[Dict[str, Any]] = []
+    bbo_rows: List[Dict[str, Any]] = []
+    returned = 0
+    quoted = 0
+    two_sided = 0
+
+    for name, meta in catalog.items():
+        ticker = tickers.get(name)
+        if not ticker:
+            continue
+        returned += 1
+        index_price = fnum(ticker_value(ticker, "index_price", "I"))
+        bid = fnum(ticker_value(ticker, "best_bid_price", "b"))
+        bid_size = fnum(ticker_value(ticker, "best_bid_amount", "B"))
+        ask = fnum(ticker_value(ticker, "best_ask_price", "a"))
+        ask_size = fnum(ticker_value(ticker, "best_ask_amount", "A"))
+        valid_bid = bool(bid and bid_size and bid > 0 and bid_size > 0)
+        valid_ask = bool(ask and ask_size and ask > 0 and ask_size > 0)
+        quoted += int(valid_bid or valid_ask)
+        two_sided += int(valid_bid and valid_ask)
+        bbo_rows.append(
+            {
+                "instrument": name,
+                "bid": bid if valid_bid else None,
+                "bid_size": bid_size if valid_bid else None,
+                "ask": ask if valid_ask else None,
+                "ask_size": ask_size if valid_ask else None,
+                "index_price": index_price,
+            }
+        )
+        if not index_price or index_price <= 0:
+            continue
+
+        if fee_rate is None or fee_rate < 0:
+            continue
+
+        sides = (
+            ("BUY", ask, ask_size, index_price - (ask or 0.0)),
+            ("SELL", bid, bid_size, (bid or 0.0) - index_price),
+        )
+        for side, price, amount, edge_per_unit in sides:
+            if not price or not amount or price <= 0 or amount <= 0:
+                continue
+            reference_notional = index_price * amount
+            executable_notional = price * amount
+            if reference_notional < min_notional:
+                continue
+            gross_usd = edge_per_unit * amount
+            fee_usd = 2 * base_fee + fee_rate * (
+                executable_notional + reference_notional
+            )
+            net_usd = gross_usd - fee_usd
+            gross_bps = gross_usd / reference_notional * 10_000
+            fee_bps = fee_usd / reference_notional * 10_000
+            net_bps = net_usd / reference_notional * 10_000
+            if net_bps < min_edge_bps or net_usd <= 0:
+                continue
+            rows.append(
+                {
+                    "venue": "Derive Spot",
+                    "instrument": name,
+                    "side": side,
+                    "price": price,
+                    "amount": amount,
+                    "index_price": index_price,
+                    "depth_usd": executable_notional,
+                    "gross_bps": gross_bps,
+                    "fee_bps": fee_bps,
+                    "net_bps": net_bps,
+                    "gross_usd": gross_usd,
+                    "fee_usd": fee_usd,
+                    "net_usd": net_usd,
+                    "taker_fee_rate": fee_rate,
+                    "base_fee_per_order": base_fee,
+                    "fee_source": "public_max",
+                    "detected_at": detected_at,
+                }
+            )
+
+    rows.sort(key=lambda row: (row["net_bps"], row["net_usd"]), reverse=True)
+    summary = {
+        "venue": "Derive Spot",
+        "active": len(catalog),
+        "returned": returned,
+        "quoted": quoted,
+        "two_sided": two_sided,
+        "candidates": len(rows),
+        "bbo": sorted(bbo_rows, key=lambda row: row["instrument"]),
+    }
+    return summary, rows
+
+
+def load_derive_spot_snapshot(
+    catalog: Mapping[str, Dict[str, Any]],
+    pacer: RequestPacer,
+    min_edge_bps: float,
+    min_notional: float,
+) -> Tuple[Dict[str, Any], List[Dict[str, Any]], float]:
+    started = time.time()
+    result = derive_rpc(pacer, "public/get_tickers", {"instrument_type": "erc20"})
+    tickers = result.get("tickers", result)
+    summary, rows = derive_spot_alerts(
+        catalog,
+        tickers,
+        min_edge_bps=min_edge_bps,
+        min_notional=min_notional,
+    )
+    seconds = time.time() - started
+    summary["seconds"] = seconds
+    return summary, rows, seconds
 
 
 def bybit_get(path: str, params: Dict[str, Any]) -> Any:
@@ -345,6 +530,9 @@ def load_derive_snapshot(
     now = time.time()
     nodes: List[core.Node] = []
     active = 0
+    fee_schedule = derive_max_public_fees(
+        meta for options in catalog.values() for meta in options.values()
+    )
     for coin, options in catalog.items():
         current = {
             name: meta
@@ -352,7 +540,11 @@ def load_derive_snapshot(
             if int(meta["option_details"]["expiry"]) > now
         }
         if current:
-            nodes.extend(derive_parse_tickers(coin, current, pacer, workers))
+            nodes.extend(
+                derive_parse_tickers(
+                    coin, current, pacer, workers, fee_schedule=fee_schedule
+                )
+            )
             active += len(current)
     return nodes, active
 

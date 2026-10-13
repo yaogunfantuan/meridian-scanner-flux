@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Periodic REST option-surface scans with optional DingTalk alerts."""
+"""Periodic option-surface and Derive spot scans with DingTalk alerts."""
 
 from __future__ import annotations
 
@@ -25,7 +25,7 @@ import scanner_http
 
 
 CACHE_VERSION = 1
-ALERT_STATE_VERSION = 2
+ALERT_STATE_VERSION = 3
 DISPLAY_TIMEZONE = timezone(timedelta(hours=8))
 
 
@@ -128,6 +128,7 @@ class AlertCooldown:
         self.cooldown_seconds = cooldown_seconds
         self.recovery_misses = recovery_misses
         self.breakthrough_ratio = breakthrough_ratio
+        self.metadata: Dict[str, Any] = {}
         self.items: Dict[str, Dict[str, Any]] = self._read()
         self.seen_keys: set[str] = set()
 
@@ -135,7 +136,9 @@ class AlertCooldown:
         try:
             value = json.loads(self.path.read_text(encoding="utf-8"))
             version = value.get("version")
-            if version in (1, ALERT_STATE_VERSION) and isinstance(value.get("items"), dict):
+            if version in (1, 2, ALERT_STATE_VERSION) and isinstance(value.get("items"), dict):
+                if isinstance(value.get("metadata"), dict):
+                    self.metadata = value["metadata"]
                 items = value["items"]
                 for item in items.values():
                     # V1 retained every key forever but did not persist enough
@@ -154,7 +157,11 @@ class AlertCooldown:
     def _write(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         temporary = self.path.with_suffix(self.path.suffix + ".tmp")
-        payload = {"version": ALERT_STATE_VERSION, "items": self.items}
+        payload = {
+            "version": ALERT_STATE_VERSION,
+            "items": self.items,
+            "metadata": self.metadata,
+        }
         temporary.write_text(
             json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
             encoding="utf-8",
@@ -177,6 +184,10 @@ class AlertCooldown:
         )
 
     @staticmethod
+    def spot_key(row: Dict[str, Any]) -> str:
+        return f"spot|{row['venue']}|{row['instrument']}|{row['side']}"
+
+    @staticmethod
     def p1_strength(row: Dict[str, Any]) -> float:
         if row["mode"] == "PCP_NET":
             return max(float(row.get("parity_net_usdt") or 0.0), 0.0)
@@ -189,6 +200,10 @@ class AlertCooldown:
     @staticmethod
     def vertical_strength(row: Dict[str, Any]) -> float:
         return max(float(row.get("net_usdt") or 0.0), 0.0)
+
+    @staticmethod
+    def spot_strength(row: Dict[str, Any]) -> float:
+        return max(float(row.get("net_bps") or 0.0), 0.0)
 
     def _allows(self, key: str, strength: float, now: float) -> bool:
         if self.cooldown_seconds <= 0:
@@ -279,6 +294,18 @@ class AlertCooldown:
             self.seen_keys.add(key)
         return allowed
 
+    def filter_spots(
+        self, rows: Sequence[Dict[str, Any]], now: float
+    ) -> List[Dict[str, Any]]:
+        allowed: List[Dict[str, Any]] = []
+        for row in rows:
+            key = self.spot_key(row)
+            strength = self.spot_strength(row)
+            if self._observe(key, "spot", row, strength, now):
+                allowed.append(row)
+            self.seen_keys.add(key)
+        return allowed
+
     def finish_round(self, now: float | None = None) -> List[Dict[str, Any]]:
         now = time.time() if now is None else now
         recovered: List[Dict[str, Any]] = []
@@ -308,6 +335,17 @@ class AlertCooldown:
 
     def write(self) -> None:
         self._write()
+
+    def spot_summary_due(self, now: float, interval: float) -> bool:
+        if interval <= 0:
+            return False
+        if "spot_summary_sent_at" not in self.metadata:
+            return True
+        last_sent_at = float(self.metadata.get("spot_summary_sent_at", 0.0))
+        return now - last_sent_at >= interval
+
+    def mark_spot_summary_sent(self, now: float) -> None:
+        self.metadata["spot_summary_sent_at"] = now
 
 
 def actionable_one_ticks(
@@ -470,6 +508,37 @@ def print_tick_alerts(rows: Sequence[Dict[str, Any]], limit: int) -> None:
     )
 
 
+def print_spot_alerts(
+    summary: Dict[str, Any] | None,
+    rows: Sequence[Dict[str, Any]],
+    limit: int,
+) -> None:
+    if summary is None:
+        return
+    print(
+        "\nDerive Spot: "
+        f"active={summary['active']} returned={summary['returned']} "
+        f"quoted={summary['quoted']} two_sided={summary['two_sided']} "
+        f"alerts={summary['candidates']} seconds={summary['seconds']:.4f}"
+    )
+    shown = list(rows[:limit])
+    print(f"现货净偏离异常: {len(rows)}（显示前 {len(shown)}）")
+    core.print_table(
+        (
+            "instrument", "side", "price", "index", "amount", "depth_$",
+            "gross_bp", "fee_bp", "net_bp", "net_$", "fee_source",
+        ),
+        [
+            (
+                row["instrument"], row["side"], row["price"], row["index_price"],
+                row["amount"], row["depth_usd"], row["gross_bps"], row["fee_bps"],
+                row["net_bps"], row["net_usd"], row["fee_source"],
+            )
+            for row in shown
+        ],
+    )
+
+
 def format_duration(seconds: float) -> str:
     seconds = max(int(round(seconds)), 0)
     days, seconds = divmod(seconds, 86400)
@@ -518,6 +587,11 @@ def format_recovery_row(recovery: Dict[str, Any]) -> str:
             f"{row.get('venue', '-')} {row.get('instrument', '-')} "
             f"{row.get('signal', '')}；{row.get('mode', '')}"
         )
+    elif kind == "spot":
+        identity = (
+            f"{row.get('venue', '-')} {row.get('instrument', '-')} "
+            f"{row.get('side', '')}；净偏离 {float(row.get('net_bps', 0.0)):.1f}bp"
+        )
     else:
         identity = (
             f"{row.get('venue', '-')} {row.get('instrument', '-')} "
@@ -542,9 +616,10 @@ def format_dingtalk_message(
     ticker_bytes: int,
     limit: int,
     recovered_rows: Sequence[Dict[str, Any]] = (),
+    spot_rows: Sequence[Dict[str, Any]] = (),
 ) -> str:
     lines = [
-        f"【Scanner 期权曲面扫描】{stamp}",
+        f"【Scanner Derive Spot / 期权扫描】{stamp}",
         f"耗时 {elapsed:.1f}s；ticker {ticker_bytes / 1024 / 1024:.2f} MiB",
     ]
     used = 0
@@ -602,6 +677,18 @@ def format_dingtalk_message(
                 f"发现→通知 {format_duration(row.get('notification_delay_seconds', 0.0))}"
                 f"{format_notification_times(row)}"
             )
+    if spot_rows:
+        lines.append(f"\nDerive 现货净偏离：{len(spot_rows)}")
+        for row in spot_rows[:limit]:
+            lines.append(
+                f"{row['instrument']} {row['side']} @ {row['price']:g} × "
+                f"{row['amount']:g}；指数 {row['index_price']:g}；"
+                f"毛偏离 {row['gross_bps']:.1f}bp；往返费 {row['fee_bps']:.1f}bp；"
+                f"净偏离 {row['net_bps']:.1f}bp / {row['net_usd']:.2f} USDC；"
+                f"费率来源 {row['fee_source']}；"
+                f"发现→通知 {format_duration(row.get('notification_delay_seconds', 0.0))}"
+                f"{format_notification_times(row)}"
+            )
     if recovered_rows:
         lines.append(f"\n异常已消失：{len(recovered_rows)}")
         for recovery in recovered_rows[:limit]:
@@ -614,6 +701,30 @@ def format_dingtalk_message(
             for row in summaries
         )
     )
+    return "\n".join(lines)
+
+
+def format_spot_summary_message(
+    stamp: str,
+    summary: Dict[str, Any],
+) -> str:
+    def quote(price: Any, amount: Any) -> str:
+        if price is None or amount is None:
+            return "-"
+        return f"{float(price):g} × {float(amount):g}"
+
+    lines = [
+        f"【Derive Spot 每小时 BBO】{stamp}",
+        f"活跃 {summary['active']}；返回 {summary['returned']}；"
+        f"有报价 {summary['quoted']}；双边 {summary['two_sided']}",
+    ]
+    for row in summary.get("bbo", []):
+        index_price = row.get("index_price")
+        index_text = "-" if index_price is None else f"{float(index_price):g}"
+        lines.append(
+            f"{row['instrument']}｜bid {quote(row.get('bid'), row.get('bid_size'))}｜"
+            f"ask {quote(row.get('ask'), row.get('ask_size'))}｜index {index_text}"
+        )
     return "\n".join(lines)
 
 
@@ -725,7 +836,9 @@ def add_scan_arguments(parser: argparse.ArgumentParser) -> None:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="每分钟用 REST 快照扫描期权曲面并可选推送钉钉")
+    parser = argparse.ArgumentParser(
+        description="定时用 REST 快照扫描期权曲面和 Derive Spot，并可选推送钉钉"
+    )
     parser.add_argument("--exchange", choices=("all",) + adapters.VENUES, default="all")
     parser.add_argument("--underlying", type=str.upper)
     parser.add_argument("--interval", type=float, default=60.0)
@@ -747,6 +860,30 @@ def parse_args() -> argparse.Namespace:
         action=argparse.BooleanOptionalAction,
         default=True,
         help="是否把有效 1-tick 异常加入钉钉消息；默认启用",
+    )
+    parser.add_argument(
+        "--derive-spot",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="监控全部 Derive 现货盘口相对指数价的手续费后净偏离",
+    )
+    parser.add_argument(
+        "--spot-min-edge-bps",
+        type=float,
+        default=50.0,
+        help="Derive Spot 扣双边 Taker 费后的最小提醒偏离，默认 50bp",
+    )
+    parser.add_argument(
+        "--spot-min-notional",
+        type=float,
+        default=10.0,
+        help="Derive Spot 最佳档最小指数名义金额，默认 10 USDC",
+    )
+    parser.add_argument(
+        "--spot-summary-interval",
+        type=float,
+        default=3600.0,
+        help="Derive Spot BBO+index 钉钉总结间隔秒数；0 表示关闭，默认 3600",
     )
     parser.add_argument("--once", action="store_true")
     mode = parser.add_mutually_exclusive_group()
@@ -770,6 +907,16 @@ def parse_args() -> argparse.Namespace:
         parser.error("alert-cooldown-seconds 和 alert-recovery-misses 不能小于 0")
     if args.alert_breakthrough_ratio < 0:
         parser.error("alert-breakthrough-ratio 不能小于 0")
+    if (
+        args.spot_min_edge_bps < 0
+        or args.spot_min_notional < 0
+        or args.spot_summary_interval < 0
+    ):
+        parser.error(
+            "spot-min-edge-bps、spot-min-notional 和 spot-summary-interval 不能小于 0"
+        )
+    if args.derive_spot and args.exchange not in ("all", "derive"):
+        parser.error("--derive-spot 只能与 --exchange all/derive 一起使用")
     if args.notify and not os.environ.get("DINGTALK_WEBHOOK_URL"):
         parser.error("--notify 需要环境变量 DINGTALK_WEBHOOK_URL")
     return args
@@ -779,6 +926,9 @@ def main() -> int:
     args = parse_args()
     venues = adapters.VENUES if args.exchange == "all" else (args.exchange,)
     pacer = adapters.RequestPacer(args.rate_limit)
+    derive_spot_catalog: Dict[str, Dict[str, Any]] | None = None
+    derive_spot_catalog_fetched_at = 0.0
+    derive_spot_enabled = args.derive_spot and "derive" in venues
     catalog_manager = CatalogManager(
         args.cache, args.catalog_ttl, args.workers, args.underlying, pacer
     )
@@ -798,6 +948,23 @@ def main() -> int:
         while True:
             round_started = time.time()
             before_catalog = scanner_http.total_response_bytes()
+            if (
+                derive_spot_enabled
+                and (
+                    derive_spot_catalog is None
+                    or round_started - derive_spot_catalog_fetched_at
+                    >= args.catalog_ttl
+                )
+            ):
+                try:
+                    derive_spot_catalog = adapters.fetch_derive_spot_catalog(pacer)
+                    derive_spot_catalog_fetched_at = round_started
+                except Exception as exc:
+                    print(
+                        f"Derive Spot: 目录刷新失败"
+                        f"{'，继续使用旧值' if derive_spot_catalog else ''}（{exc}）",
+                        file=sys.stderr,
+                    )
             catalogs, refreshed = catalog_manager.ensure(venues)
             after_catalog = scanner_http.total_response_bytes()
             if not catalogs:
@@ -808,7 +975,11 @@ def main() -> int:
             with ThreadPoolExecutor(max_workers=len(catalogs)) as executor:
                 futures = {
                     executor.submit(
-                        adapters.load_snapshot, venue, catalog, pacer, args.workers
+                        adapters.load_snapshot,
+                        venue,
+                        catalog,
+                        pacer,
+                        args.workers,
                     ): venue
                     for venue, catalog in catalogs.items()
                 }
@@ -821,6 +992,26 @@ def main() -> int:
                             f"{adapters.LABELS[venue]}: 本轮行情失败（{exc}）",
                             file=sys.stderr,
                         )
+            spot_summary: Dict[str, Any] | None = None
+            spot_rows: List[Dict[str, Any]] = []
+            if derive_spot_enabled:
+                if derive_spot_catalog is None:
+                    print(
+                        "Derive Spot: 缺少可用目录，本轮跳过。",
+                        file=sys.stderr,
+                    )
+                else:
+                    try:
+                        spot_summary, spot_rows, _spot_seconds = (
+                            adapters.load_derive_spot_snapshot(
+                                derive_spot_catalog,
+                                pacer,
+                                args.spot_min_edge_bps,
+                                args.spot_min_notional,
+                            )
+                        )
+                    except Exception as exc:
+                        print(f"Derive Spot: 本轮行情失败（{exc}）", file=sys.stderr)
             after_tickers = scanner_http.total_response_bytes()
 
             summaries: List[Dict[str, Any]] = []
@@ -891,6 +1082,7 @@ def main() -> int:
             print_vertical_alerts(vertical_rows, args.limit)
             core.print_candidate_section("手续费后可执行候选", p1_rows, args.limit)
             print_tick_alerts(tick_rows, args.limit)
+            print_spot_alerts(spot_summary, spot_rows, args.limit)
 
             record = {
                 "timestamp": stamp,
@@ -903,6 +1095,8 @@ def main() -> int:
                 "vertical_net": vertical_rows,
                 "p1": p1_rows,
                 "one_tick_alerts": tick_rows,
+                "derive_spot_summary": spot_summary,
+                "derive_spot_alerts": spot_rows,
             }
             if not args.no_log:
                 append_log(args.log, record, args.max_log_mb)
@@ -915,17 +1109,26 @@ def main() -> int:
                 notify_vertical_rows = cooldown.filter_verticals(vertical_rows, filter_time)
                 notify_p1_rows = cooldown.filter_p1(p1_rows, filter_time)
                 notify_tick_rows = cooldown.filter_ticks(eligible_tick_rows, filter_time)
+                notify_spot_rows = cooldown.filter_spots(spot_rows, filter_time)
                 recovered_rows = cooldown.finish_round(filter_time)
             else:
                 notify_vertical_rows = vertical_rows
                 notify_p1_rows = p1_rows
                 notify_tick_rows = eligible_tick_rows
+                notify_spot_rows = spot_rows
                 recovered_rows = []
 
-            if notify_vertical_rows or notify_p1_rows or notify_tick_rows or recovered_rows:
+            if (
+                notify_vertical_rows
+                or notify_p1_rows
+                or notify_tick_rows
+                or notify_spot_rows
+                or recovered_rows
+            ):
                 message = format_dingtalk_message(
                     stamp, notify_p1_rows, notify_vertical_rows, notify_tick_rows,
-                    summaries, elapsed, ticker_bytes, args.alert_limit, recovered_rows
+                    summaries, elapsed, ticker_bytes, args.alert_limit, recovered_rows,
+                    spot_rows=notify_spot_rows,
                 )
                 if args.notify:
                     try:
@@ -937,10 +1140,30 @@ def main() -> int:
                         print(f"钉钉发送失败（{exc}）", file=sys.stderr)
                 else:
                     print("钉钉：dry-run，未发送。")
-            elif vertical_rows or p1_rows or eligible_tick_rows:
+            elif vertical_rows or p1_rows or eligible_tick_rows or spot_rows:
                 print("钉钉：冷却节流后无新增/恢复/突破，未发送。")
             if args.notify:
                 cooldown.write()
+
+            summary_time = time.time()
+            if (
+                args.notify
+                and spot_summary is not None
+                and cooldown.spot_summary_due(
+                    summary_time, args.spot_summary_interval
+                )
+            ):
+                try:
+                    send_dingtalk(
+                        webhook,
+                        secret,
+                        format_spot_summary_message(stamp, spot_summary),
+                    )
+                    cooldown.mark_spot_summary_sent(summary_time)
+                    cooldown.write()
+                    print("钉钉：已发送 Derive Spot 每小时 BBO 总结。")
+                except Exception as exc:
+                    print(f"钉钉 Spot 每小时总结发送失败（{exc}）", file=sys.stderr)
 
             if args.once:
                 return 0 if summaries else 1

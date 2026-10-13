@@ -43,6 +43,7 @@ class Node:
     contract_multiplier: float = 1.0
     taker_fee_rate: float | None = None
     trade_fee_cap_rate: float | None = None
+    base_fee: float = 0.0
     settlement_fee_rate: float | None = None
     settlement_fee_cap_rate: float | None = None
     initial_margin_low: float | None = None
@@ -341,6 +342,20 @@ def option_trade_fee_per_underlying(node: Node, price: float | None) -> float | 
     return max(fee, 0.0)
 
 
+def option_trade_fee_total(
+    node: Node,
+    price: float | None,
+    quantity: float,
+) -> float | None:
+    """Return the total taker fee for one order, including its fixed base fee."""
+    if quantity <= 0 or node.base_fee < 0:
+        return None
+    variable_fee = option_trade_fee_per_underlying(node, price)
+    if variable_fee is None:
+        return None
+    return max(variable_fee * quantity + node.base_fee, 0.0)
+
+
 def option_settlement_fee_per_underlying(node: Node) -> float | None:
     """Estimate expiry fee at the calibrated forward; exactly one C/P leg is ITM."""
     if (
@@ -448,19 +463,21 @@ def executable_parity_metrics(
     ):
         return None
     quantity = size * multiplier
+    if quantity <= 0:
+        return None
     raw_ticks = edge / node.tick
     raw_usdt = edge * quantity
 
-    open_long_fee = option_trade_fee_per_underlying(long_node, long_price)
-    open_short_fee = option_trade_fee_per_underlying(short_node, short_price)
-    close_long_fee = option_trade_fee_per_underlying(long_node, long_node.bid)
-    close_short_fee = option_trade_fee_per_underlying(short_node, short_node.ask)
+    open_long_fee = option_trade_fee_total(long_node, long_price, quantity)
+    open_short_fee = option_trade_fee_total(short_node, short_price, quantity)
+    close_long_fee = option_trade_fee_total(long_node, long_node.bid, quantity)
+    close_short_fee = option_trade_fee_total(short_node, short_node.ask, quantity)
     option_fees = (open_long_fee, open_short_fee, close_long_fee, close_short_fee)
     option_roundtrip_fee = sum(option_fees) if all(fee is not None for fee in option_fees) else None
 
     index_price = node.index_price or other.index_price
     hedge_roundtrip_fee = (
-        2 * hedge_taker_rate * index_price
+        2 * hedge_taker_rate * index_price * quantity
         if index_price and index_price > 0 and hedge_taker_rate >= 0
         else None
     )
@@ -470,20 +487,26 @@ def executable_parity_metrics(
         if fully_costed
         else None
     )
-    net_points = edge - roundtrip_cost if roundtrip_cost is not None else None
+    net_usdt = raw_usdt - roundtrip_cost if roundtrip_cost is not None else None
+    net_points = net_usdt / quantity if net_usdt is not None else None
 
     settlement_node = long_node if (
         (long_node.option_type == "C" and node.forward >= node.strike)
         or (long_node.option_type == "P" and node.forward < node.strike)
     ) else short_node
-    settlement_fee = option_settlement_fee_per_underlying(settlement_node)
+    settlement_fee_per_underlying = option_settlement_fee_per_underlying(settlement_node)
+    settlement_fee = (
+        settlement_fee_per_underlying * quantity
+        if settlement_fee_per_underlying is not None
+        else None
+    )
     entry_option_fee = (
         open_long_fee + open_short_fee
         if open_long_fee is not None and open_short_fee is not None
         else None
     )
-    expiry_net_points = (
-        edge - entry_option_fee - settlement_fee
+    expiry_net_usdt = (
+        raw_usdt - entry_option_fee - settlement_fee
         if entry_option_fee is not None and settlement_fee is not None
         else None
     )
@@ -500,23 +523,24 @@ def executable_parity_metrics(
         if short_margin is not None and hedge_margin is not None
         else None
     )
-    net_usdt = net_points * quantity if net_points is not None else None
     return {
         "raw_ticks": raw_ticks,
         "raw_usdt": raw_usdt,
         "size": size,
         "quantity": quantity,
         "option_roundtrip_fee_ticks": (
-            option_roundtrip_fee / node.tick if option_roundtrip_fee is not None else None
+            option_roundtrip_fee / quantity / node.tick
+            if option_roundtrip_fee is not None
+            else None
         ),
         "hedge_roundtrip_fee_ticks": (
-            hedge_roundtrip_fee / node.tick if hedge_roundtrip_fee is not None else None
+            hedge_roundtrip_fee / quantity / node.tick
+            if hedge_roundtrip_fee is not None
+            else None
         ),
         "net_ticks": net_points / node.tick if net_points is not None else None,
         "net_usdt": net_usdt,
-        "expiry_net_usdt": (
-            expiry_net_points * quantity if expiry_net_points is not None else None
-        ),
+        "expiry_net_usdt": expiry_net_usdt,
         "capital_est_usdt": capital,
         "return_bps": (
             net_usdt / capital * 10_000
@@ -601,18 +625,25 @@ def find_vertical_arbitrages(
                     size = min(long_node.ask_size or 0.0, short_node.bid_size or 0.0)
                     if size < min_size:
                         continue
+                    quantity = size * multiplier
+                    if quantity <= 0:
+                        continue
                     entry_credit = short_node.bid - long_node.ask
                     raw_edge = entry_credit - max_liability
-                    long_fee = option_trade_fee_per_underlying(long_node, long_node.ask)
-                    short_fee = option_trade_fee_per_underlying(short_node, short_node.bid)
+                    long_fee = option_trade_fee_total(
+                        long_node, long_node.ask, quantity
+                    )
+                    short_fee = option_trade_fee_total(
+                        short_node, short_node.bid, quantity
+                    )
                     if long_fee is None or short_fee is None:
                         continue
-                    fee_points = long_fee + short_fee
-                    net_edge = raw_edge - fee_points
+                    fee_usdt = long_fee + short_fee
+                    net_usdt = raw_edge * quantity - fee_usdt
+                    net_edge = net_usdt / quantity
                     net_ticks = net_edge / tick
                     if net_ticks < min_edge_ticks:
                         continue
-                    quantity = size * multiplier
                     rows.append(
                         {
                             "underlying": low.underlying,
@@ -629,9 +660,9 @@ def find_vertical_arbitrages(
                             "entry_credit": entry_credit,
                             "max_liability_pv": max_liability,
                             "gross_edge_ticks": raw_edge / tick,
-                            "fee_usdt": fee_points * quantity,
+                            "fee_usdt": fee_usdt,
                             "net_edge_ticks": net_ticks,
-                            "net_usdt": net_edge * quantity,
+                            "net_usdt": net_usdt,
                         }
                     )
     return sorted(
@@ -819,12 +850,16 @@ def find_candidates(
                     or iv_edge < args.min_iv_edge
                 ):
                     continue
+                single_quantity = size * node.contract_multiplier
+                if single_quantity <= 0:
+                    continue
                 zscore = iv_edge / denominator
                 gross_edge_ticks = price_edge / node.tick
-                open_fee = option_trade_fee_per_underlying(node, price)
+                open_fee = option_trade_fee_total(node, price, single_quantity)
+                single_fee_usdt = 2 * open_fee if open_fee is not None else None
                 single_fee_ticks = (
-                    2 * open_fee / node.tick
-                    if open_fee is not None
+                    single_fee_usdt / single_quantity / node.tick
+                    if single_fee_usdt is not None
                     else None
                 )
                 net_edge_ticks = gross_edge_ticks
@@ -876,13 +911,7 @@ def find_candidates(
                     if left_neighbors and right_neighbors
                     else None
                 )
-                single_quantity = size * node.contract_multiplier
                 single_gross_usdt = gross_edge_ticks * node.tick * single_quantity
-                single_fee_usdt = (
-                    single_fee_ticks * node.tick * single_quantity
-                    if single_fee_ticks is not None
-                    else None
-                )
                 single_net_usdt = net_edge_ticks * node.tick * single_quantity
                 single_capital = (
                     price * single_quantity
